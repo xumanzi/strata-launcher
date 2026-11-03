@@ -1,0 +1,364 @@
+"""Shared launcher checks, independent of the context service and GUI."""
+import csv
+import ctypes
+import hashlib
+import io
+import ipaddress
+import json
+import os
+import re
+import socket
+import subprocess
+import tempfile
+import urllib.error
+import urllib.request
+from pathlib import Path, PureWindowsPath
+
+
+
+def local_context_choices(config):
+    local = config.get('local_import')
+    if not local:
+        return None
+    args = config.get('args', [])
+    def value(flag):
+        return args[args.index(flag) + 1] if flag in args else None
+    return dict(family=local.get('family'), model=local.get('model'),
+                context=int(value('--max-context')) if value('--max-context') else None,
+                kv=value('--kv'), local_import=True)
+
+
+def save_local_context(path, context):
+    """Update imported model context without regenerating its model configuration."""
+    if isinstance(context, bool) or not isinstance(context, int) or context <= 0:
+        raise ValueError('上下文必须是正整数')
+    path = Path(path)
+    original = path.read_bytes()
+    config = json.loads(original.decode('utf-8-sig'))
+    if not config.get('local_import'):
+        raise ValueError('该配置不是本地导入模型')
+    args = list(config.get('args', []))
+    def value(flag):
+        return args[args.index(flag) + 1] if flag in args else None
+    def remove(flag):
+        while flag in args:
+            i = args.index(flag)
+            del args[i:i + 2]
+    def set_value(flag, val):
+        if flag in args:
+            args[args.index(flag) + 1] = str(val)
+        else:
+            args.extend([flag, str(val)])
+    old_context = int(value('--max-context') or 32768)
+    scaling, scale = value('--rope-scaling'), value('--rope-scale')
+    trained = 262144
+    automatic = config.get('launcher_context_auto_rope', False) or (
+        scaling == 'yarn' and old_context > trained and scale is not None
+        and abs(float(scale) - old_context / trained) < 1e-6)
+    if automatic:
+        remove('--rope-scaling'); remove('--rope-scale')
+        scaling = None
+    if context > trained and scaling in (None, 'none'):
+        set_value('--rope-scaling', 'yarn')
+        set_value('--rope-scale', format(context / trained, 'g'))
+        config['launcher_context_auto_rope'] = True
+    else:
+        config.pop('launcher_context_auto_rope', None)
+    if context < 65536:
+        remove('--kv-resident')
+    if context > 8192 and '--kv' not in args:
+        set_value('--kv', 'int8')
+    set_value('--max-context', context)
+    config['args'] = args
+    Path(str(path) + '.context-size.bak').write_bytes(original)
+    temp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent,
+                                         suffix='.tmp', delete=False) as stream:
+            temp = Path(stream.name)
+            json.dump(config, stream, ensure_ascii=False, indent=2)
+            stream.write('\n')
+        os.replace(temp, path)
+    finally:
+        if temp and temp.exists():
+            temp.unlink()
+    return config
+
+
+def _short_windows_path(path):
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    get_short = kernel.GetShortPathNameW
+    get_short.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint]
+    get_short.restype = ctypes.c_uint
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = get_short(str(path), buffer, len(buffer))
+    return buffer.value if 0 < length < len(buffer) else str(path)
+
+
+def _ascii_directory_alias(directory):
+    """An NTFS junction is an alternate path; no model files are copied or moved."""
+    import _winapi
+    target = Path(directory).resolve()
+    base = Path(_short_windows_path(tempfile.gettempdir()))
+    if not str(base).isascii():
+        base = Path(os.environ.get('ProgramData', 'C:/ProgramData'))
+    if not str(base).isascii():
+        raise OSError('没有可用的英文路径别名目录')
+    aliases = base / 'strata-path-aliases'
+    aliases.mkdir(parents=True, exist_ok=True)
+    alias = aliases / hashlib.sha256(str(target).casefold().encode('utf-8')).hexdigest()[:24]
+    if not alias.exists():
+        try:
+            _winapi.CreateJunction(str(target), str(alias))
+        except FileExistsError:
+            pass
+    if not os.path.samefile(alias, target):
+        raise OSError('路径别名指向其他目录')
+    return str(alias)
+
+
+def windows_engine_path(value):
+    """Keep narrow Windows argv compatible with the engine's UTF-8 file reader."""
+    if os.name != 'nt' or not isinstance(value, str) or value.isascii():
+        return value
+    path = Path(value)
+    # GGUF filenames encode the shard pattern; shortening them loses that information.
+    if path.is_dir():
+        short = _short_windows_path(path)
+        if short.isascii() and os.path.samefile(short, path):
+            return short
+    parent = _short_windows_path(path.parent)
+    candidate = str(Path(parent) / path.name)
+    if candidate.isascii() and (not path.exists() or os.path.samefile(candidate, path)):
+        return candidate
+    try:
+        candidate = str(Path(_ascii_directory_alias(path.parent)) / path.name)
+        if candidate.isascii() and (not path.exists() or os.path.samefile(candidate, path)):
+            return candidate
+    except OSError:
+        pass
+    raise ValueError(f'引擎无法安全读取中文路径：{value}。无法建立英文路径别名，请将模型放入全英文路径后重新导入。原文件未移动。')
+
+
+def prepare_engine_paths(config):
+    adapted = dict(config)
+    for key in ('exe', 'cwd', 'tokenizer', 'log'):
+        if isinstance(adapted.get(key), str):
+            adapted[key] = windows_engine_path(adapted[key])
+    if isinstance(adapted.get('args'), list):
+        converted = []
+        original_args = adapted['args']
+        for index, arg in enumerate(original_args):
+            if index and original_args[index - 1] == '--control-vector-scaled' and isinstance(arg, str):
+                path, separator, strength = arg.rpartition(':')
+                try:
+                    float(strength)
+                    scaled = bool(separator and path)
+                except ValueError:
+                    scaled = False
+                if scaled:
+                    converted.append(windows_engine_path(path) + ':' + strength)
+                    continue
+            converted.append(windows_engine_path(arg) if isinstance(arg, str) and (
+                Path(arg).is_absolute() or PureWindowsPath(arg).is_absolute()) else arg)
+        adapted['args'] = converted
+    if isinstance(adapted.get('lib_dirs'), list):
+        adapted['lib_dirs'] = [windows_engine_path(path) for path in adapted['lib_dirs']]
+    if isinstance(adapted.get('vision'), dict):
+        adapted['vision'] = {key: windows_engine_path(value) if key in ('exe', 'cwd', 'model', 'mmproj')
+                             else value for key, value in adapted['vision'].items()}
+    return adapted
+
+
+def api_model_name(config):
+    if config.get('local_import'):
+        args = config.get('args') or []
+        if '--native' in args and args.index('--native') + 1 < len(args):
+            filename = PureWindowsPath(str(args[args.index('--native') + 1])).name
+            return re.sub(r'-\d{5}-of-\d{5}\.gguf$', '', filename, flags=re.I)
+    return str(config.get('model_name') or '')
+
+
+def select_lan_ipv4(adapters):
+    candidates = []
+    for adapter in adapters:
+        if not adapter.get('Physical') or not adapter.get('Up'):
+            continue
+        ips = adapter.get('IPs') or []
+        for value in ([ips] if isinstance(ips, str) else ips):
+            try:
+                address = ipaddress.ip_address(value)
+            except ValueError:
+                continue
+            if address.version != 4 or address.is_loopback or address.is_link_local or address.is_unspecified:
+                continue
+            if not address.is_private:
+                continue
+            candidates.append((not adapter.get('Gateway', False), int(adapter.get('Metric') or 9999), str(address)))
+    candidates.sort()
+    return [candidates[0][2]] if candidates else []
+
+
+def configured_lan_ipv4():
+    if os.name != 'nt':
+        return []
+    script = '''$ErrorActionPreference='Stop'
+$items=@(Get-NetAdapter -Physical | Where-Object Status -eq 'Up' | ForEach-Object {
+ $idx=$_.ifIndex
+ $ips=@(Get-NetIPAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object AddressState -eq 'Preferred' | Select-Object -ExpandProperty IPAddress)
+ $metric=(Get-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty InterfaceMetric)
+ $gw=@(Get-NetRoute -InterfaceIndex $idx -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue)
+ [pscustomobject]@{Physical=$true;Up=$true;IPs=$ips;Metric=$metric;Gateway=($gw.Count -gt 0)}
+})
+ConvertTo-Json -InputObject $items -Compress -Depth 4'''
+    powershell = Path(os.environ.get('SystemRoot', 'C:/Windows')) / 'System32/WindowsPowerShell/v1.0/powershell.exe'
+    try:
+        result = _capture([str(powershell), '-NoProfile', '-NonInteractive', '-Command', script], timeout=10)
+        if result.returncode == 0:
+            adapters = json.loads(result.stdout or '[]')
+            return select_lan_ipv4([adapters] if isinstance(adapters, dict) else adapters)
+    except (OSError, ValueError, TypeError, subprocess.TimeoutExpired):
+        pass
+    return []
+
+
+def connection_fields(config, actual_port=None, ips=(), api_key=None):
+    port = int(actual_port or config.get('port') or 8080)
+    local = f'http://127.0.0.1:{port}'
+    host = config.get('host') or '127.0.0.1'
+    lan = '未开启'
+    if host in ('0.0.0.0', '::'):
+        ip = next(iter(ips), None)
+        lan = (f'http://[{ip}]:{port}' if ':' in ip else f'http://{ip}:{port}') if ip else '未检测到局域网地址'
+    if host not in ('0.0.0.0', '::', '127.0.0.1', 'localhost'):
+        lan = f'http://[{host}]:{port}' if ':' in host else f'http://{host}:{port}'
+    return [('模型名称', api_model_name(config)), ('本机访问地址', local), ('局域网访问地址', lan),
+            ('APIkey', str(config.get('api_key') or '') if api_key is None else api_key)]
+
+
+def http_probe(url, timeout=2.0):
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(url, timeout=timeout) as response:
+            return response.status, response.read(1024 * 1024).decode('utf-8', 'replace')
+    except urllib.error.HTTPError as error:
+        return error.code, error.read(8192).decode('utf-8', 'replace')
+    except (OSError, urllib.error.URLError) as error:
+        return 0, str(error)
+
+
+def strata_health_ready(status, body):
+    if status != 200:
+        return False
+    try:
+        health = json.loads(body)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(health, dict) and health.get('service') == 'strata' and health.get('status') == 'ok'
+
+
+def port_in_use(port):
+    port = int(port)
+    if not 1 <= port <= 65535:
+        raise ValueError('端口必须在 1 至 65535 之间')
+    for family, address in ((socket.AF_INET, '0.0.0.0'), (socket.AF_INET6, '::')):
+        try:
+            with socket.socket(family) as sock:
+                if os.name == 'nt':
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                sock.bind((address, port))
+        except OSError as error:
+            if family == socket.AF_INET6 and error.errno in (97, 10047, 10049):
+                continue
+            return True
+    return False
+
+
+def _capture(command, timeout=4):
+    return subprocess.run(command, capture_output=True, text=True, errors='replace',
+        timeout=timeout, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+
+
+def port_owner(port):
+    if os.name != 'nt':
+        return 0, ''
+    try:
+        result = _capture(['netstat', '-ano', '-p', 'tcp'])
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) < 5 or fields[0].upper() != 'TCP':
+                continue
+            if fields[1].rsplit(':', 1)[-1] != str(int(port)):
+                continue
+            if fields[-2].upper() != 'LISTENING' and fields[-2] != '侦听':
+                continue
+            pid = int(fields[-1])
+            names = _capture(['tasklist', '/FI', f'PID eq {pid}', '/FO', 'CSV', '/NH'])
+            for row in csv.reader(io.StringIO(names.stdout)):
+                if len(row) >= 2 and row[1] == str(pid):
+                    return pid, row[0]
+            return pid, ''
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    return 0, ''
+
+
+def is_protected_process(name):
+    return str(name or '').lower() in {'system', 'system idle process', 'registry',
+        'smss.exe', 'csrss.exe', 'wininit.exe', 'winlogon.exe', 'services.exe',
+        'lsass.exe', 'svchost.exe', 'dwm.exe', 'fontdrvhost.exe', 'secure system'}
+
+
+def kill_pid_force(pid):
+    try:
+        pid = int(pid)
+        if pid <= 4 or pid == os.getpid():
+            return False, '不能结束系统进程或启动器自身'
+        if os.name != 'nt':
+            return False, '该端口修复功能仅支持 Windows'
+        result = _capture(['taskkill', '/F', '/T', '/PID', str(pid)])
+        return result.returncode == 0, (result.stdout or result.stderr).strip()
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        return False, str(error)
+
+
+def resolve_launch_config(config, root):
+    """Adapt existing local-drive paths to their verified shared-directory equivalents."""
+    root = Path(root).resolve()
+    old_cwd = PureWindowsPath(str(config.get('cwd') or ''))
+    def resolve(value):
+        if not isinstance(value, str) or not value or Path(value).exists():
+            return value
+        old = PureWindowsPath(value)
+        if not old.is_absolute():
+            return value
+        candidates = []
+        if old_cwd.is_absolute():
+            for previous, current in ((old_cwd, root), (old_cwd.parent, root.parent)):
+                try:
+                    candidates.append(current / old.relative_to(previous))
+                except ValueError:
+                    pass
+        if root.drive.startswith('\\\\') and root.drive.rsplit('\\', 1)[-1].lower() == old.drive.rstrip(':').lower():
+            candidates.append(Path(root.anchor) / old.relative_to(old.anchor))
+        return str(next((candidate for candidate in candidates if candidate.exists()), value))
+    adapted = dict(config)
+    for key in ('exe', 'cwd', 'tokenizer', 'log'):
+        if key in adapted:
+            adapted[key] = resolve(adapted[key])
+    if isinstance(adapted.get('args'), list):
+        adapted['args'] = [resolve(arg) for arg in adapted['args']]
+    if isinstance(adapted.get('lib_dirs'), list):
+        adapted['lib_dirs'] = [resolve(path) for path in adapted['lib_dirs']]
+    if isinstance(adapted.get('vision'), dict):
+        adapted['vision'] = {k: resolve(v) if k in ('exe', 'cwd', 'model', 'mmproj') else v
+                             for k, v in adapted['vision'].items()}
+    exe = adapted.get('exe')
+    if isinstance(exe, str) and not PureWindowsPath(exe).is_absolute():
+        cwd = Path(adapted.get('cwd') or root)
+        if not cwd.is_absolute():
+            cwd = root / cwd
+        candidate = cwd / exe
+        if candidate.is_file():
+            adapted['exe'] = str(candidate.resolve())
+    return adapted

@@ -1,0 +1,12 @@
+{
+  "version": "3.5.1",
+  "official_release": "0.2.6",
+  "features": [
+    "automatic-paginated-release-discovery",
+    "official-release-page-fallback",
+    "isolated-release-environments",
+    "pinned-release-engine-feed",
+    "offline-environment-switch-and-rollback",
+    "version-specific-argument-validation"
+  ]
+}

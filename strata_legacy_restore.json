@@ -1,0 +1,55 @@
+{
+  "variants": [
+    {
+      "server_hash": "00363f65a0c1f9aaa9b15f650297442d5d286cef1795934db93673525fe3bc41",
+      "files": {
+        "server.py": {
+          "original_hash": "b90e873308e5b5be74aecd2032e71dd4db1c83d0895d83a77e1c1d9d9c704dfc",
+          "patched_hashes": [
+            "00363f65a0c1f9aaa9b15f650297442d5d286cef1795934db93673525fe3bc41"
+          ]
+        },
+        "runconfig.py": {
+          "original_hash": "08c5ee5af5b599d11c25778725613948b8f6b8b74432aa6b645845e6d145bf31",
+          "patched_hashes": [
+            "3ea1436882c4680db254b9563f1be2ef5b6ed8b2ed470fcc1870a3032114ea34"
+          ]
+        }
+      }
+    },
+    {
+      "server_hash": "73b094d3858ff7399dfcc470792c951046dc9aaada664e5f83c74ad2139c08e7",
+      "files": {
+        "server.py": {
+          "original_hash": "b90e873308e5b5be74aecd2032e71dd4db1c83d0895d83a77e1c1d9d9c704dfc",
+          "patched_hashes": [
+            "73b094d3858ff7399dfcc470792c951046dc9aaada664e5f83c74ad2139c08e7"
+          ]
+        },
+        "runconfig.py": {
+          "original_hash": "08c5ee5af5b599d11c25778725613948b8f6b8b74432aa6b645845e6d145bf31",
+          "patched_hashes": [
+            "45cc2d05b68eda7182b7cfc8862b035287a76e77502508215d76259a276bc89e"
+          ]
+        }
+      }
+    },
+    {
+      "server_hash": "d3c8ec1561daa79425beb97ec57e6bca0071d9fbf5f3865d6f54d553776dbe68",
+      "files": {
+        "server.py": {
+          "original_hash": "cfed32b2be52ffde372aebb8a4ab889234a9f4fb3aa4ad17dfdb6f54b833773b",
+          "patched_hashes": [
+            "d3c8ec1561daa79425beb97ec57e6bca0071d9fbf5f3865d6f54d553776dbe68"
+          ]
+        },
+        "runconfig.py": {
+          "original_hash": "08c5ee5af5b599d11c25778725613948b8f6b8b74432aa6b645845e6d145bf31",
+          "patched_hashes": [
+            "3ea1436882c4680db254b9563f1be2ef5b6ed8b2ed470fcc1870a3032114ea34"
+          ]
+        }
+      }
+    }
+  ]
+}
