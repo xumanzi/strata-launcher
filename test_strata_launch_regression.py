@@ -59,6 +59,26 @@ class LaunchRegression(unittest.TestCase):
    adapted=resolve_launch_config(cfg,root)
    self.assertEqual(Path(adapted['exe']),root/'engine/strata.exe')
    self.assertEqual(cfg['exe'],'engine/strata.exe')
+ def test_native_flash_next_recovers_missing_expert_profile(self):
+  from strata_launch_support import resolve_launch_config
+  with tempfile.TemporaryDirectory() as d:
+   root = Path(d).resolve()
+   shipped = root / 'data' / 'expert-profile.bin'
+   shipped.parent.mkdir()
+   shipped.touch()
+   missing = str(root / 'retired-release.bin')
+   cfg = {'backend': 'cuda', 'model_name': 'Qwen3.8-Flash-Next-IQ3_S',
+          'local_import': {'family': 'qwen'},
+          'args': ['--native', 'model.gguf', '--expert-cache', 'auto',
+                   '--spec', '4', '--expert-profile', missing]}
+   resolved = resolve_launch_config(cfg, root)
+   self.assertEqual(resolved['args'], cfg['args'][:-1] + [str(shipped)])
+   self.assertEqual(cfg['args'][-1], missing)
+   custom = root / 'custom.bin'
+   custom.touch()
+   cfg['args'][-1] = str(custom)
+   self.assertEqual(resolve_launch_config(cfg, root)['args'], cfg['args'])
+
  def test_moved_installation_paths_resolved_without_mutation(self):
   from strata_launch_support import resolve_launch_config
   with tempfile.TemporaryDirectory() as d:

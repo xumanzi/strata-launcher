@@ -23,9 +23,43 @@ def is_deepseek_config(config):
     return config.get('arch') == 'deepseek41' or Path(str(config.get('exe', ''))).name.lower() in ('strata-dsv41', 'strata-dsv41.exe')
 
 
+def is_shape_config(config):
+    return (config.get('arch') in ('hy4flash', 'inkling2_loop')
+            or config.get('exe') in ('component:strata-hy4', 'component:strata-inkling'))
+
+
+COMPONENT_SLOTS = ("auto", "cuda", "hip", "sycl", "metal", "cpu", "vulkan")
+
+
+def is_external_config(config):
+    return config.get("engine") == "llama.cpp"
+
+
+def component_slot(root, config):
+    store = Path(root).resolve() / ".strata-launcher-components"
+    backend = config.get("backend")
+    exe = Path(resolve_launch_config(config, root)["exe"]).resolve()
+    try:
+        parts = exe.relative_to(store).parts
+    except ValueError:
+        parts = ()
+    if parts and parts[0] in COMPONENT_SLOTS and parts[0] in ("auto", backend or parts[0]):
+        return parts[0]
+    preferred = backend or "auto"
+    if backend or any((store / "auto" / "engine").glob("*/engine-component.json")):
+        return preferred
+    populated = [slot for slot in COMPONENT_SLOTS[1:]
+                 if any((store / slot / "engine").glob("*/engine-component.json"))]
+    return populated[0] if len(populated) == 1 else preferred
+
+
 def fingerprint(root):
-    return {name: hashlib.sha256((Path(root) / name).read_bytes()).hexdigest()
-            for name in ('setup.py', 'CMakeLists.txt')}
+    root = Path(root)
+    cmake = root / 'CMakeLists.txt'
+    if not cmake.is_file():
+        cmake = root.parent / 'engine/CMakeLists.txt'
+    return {'setup.py': hashlib.sha256((root / 'setup.py').read_bytes()).hexdigest(),
+            'CMakeLists.txt': hashlib.sha256(cmake.read_bytes()).hexdigest()}
 
 
 def record_release(root, version, marker=MARKER):
@@ -59,7 +93,10 @@ def model_configs(root):
 def engine_targets(root):
     root = Path(root)
     targets = {}
-    for cfg in model_configs(root).values():
+    configs = model_configs(root)
+    for cfg in configs.values():
+        if is_shape_config(cfg) or is_external_config(cfg):
+            continue  # Official shape_engine resolves and verifies its own signed package.
         if cfg['exe'] == 'component:strata-engine':
             raise RuntimeError('组件引用尚未解析，请先完成启动器的组件更新。')
         if cfg.get('exe'):
@@ -68,7 +105,7 @@ def engine_targets(root):
             if not exe.is_absolute():
                 exe = root / exe
             targets[exe.resolve()] = cfg.get('backend', '')
-    for folder in (() if targets else ('engine', 'engine-cuda12')):
+    for folder in (() if configs else ('engine', 'engine-cuda12')):
         exe = root / folder / 'strata.exe'
         if exe.exists():
             targets.setdefault(exe.resolve(), '')
@@ -217,6 +254,7 @@ def activate_components(root, choices):
         original = path.read_bytes()
         data = json.loads(original.decode('utf-8-sig'))
         adapted = resolve_launch_config(data, root)
+        data = dict(adapted)
         old = Path(adapted['exe']).parent if adapted['exe'] != 'component:strata-engine' else None
         meta = component_metadata(folder)
         expected = ('strata-dsv41.exe', 'strata-dsv41') if is_deepseek_config(data) else ('strata.exe', 'strata')
@@ -233,9 +271,12 @@ def activate_components(root, choices):
                 if parent not in lib_dirs:
                     lib_dirs.append(parent)
         for value in adapted.get('lib_dirs') or []:
-            if old and not Path(value).resolve().is_relative_to(old.resolve()) and value not in lib_dirs:
+            if (old and Path(value).is_dir()
+                    and '.strata-versions' not in Path(value).parts
+                    and not Path(value).resolve().is_relative_to(old.resolve()) and value not in lib_dirs):
                 lib_dirs.append(value)
         data['lib_dirs'] = lib_dirs
+        data['cwd'] = str(Path(root).resolve())
         if isinstance(data.get('vision'), dict) and data['vision'].get('exe'):
             vision_name = Path(data['vision']['exe']).name
             vexe = folder / vision_name
@@ -245,6 +286,8 @@ def activate_components(root, choices):
             data['vision']['lib_dirs'] = lib_dirs
             if old and Path(str(data['vision'].get('cwd', ''))).resolve() == old.resolve():
                 data['vision']['cwd'] = str(folder)
+        if data == json.loads(original.decode('utf-8-sig')):
+            continue
         originals[path] = original
         prepared[path] = data
     for path, original in originals.items():
@@ -263,6 +306,37 @@ def activate_components(root, choices):
             tmp.write_bytes(originals[path])
             tmp.replace(path)
         raise
+
+
+def repair_active_configs(root, selected=None):
+    """Bind every saved model to the verified active component for its backend."""
+    root = Path(root).resolve()
+    store = root / '.strata-launcher-components'
+    if not store.is_dir():
+        return
+    choices = {}
+    configs = {path: cfg for path, cfg in model_configs(root).items()
+               if not is_shape_config(cfg) and not is_external_config(cfg)
+               and (selected is None or path.resolve() == Path(selected).resolve())}
+    if not configs:
+        return
+    ec = load_component_api(root)
+    for path, config in configs.items():
+        if is_deepseek_config(config):
+            candidates = list((store / 'deepseek41').rglob('engine-component.json'))
+            if not candidates:
+                raise RuntimeError('当前环境缺少 DeepSeek 签名组件，请先完成更新。')
+            manifest = max(candidates, key=lambda item: item.stat().st_mtime_ns)
+            component_metadata(manifest.parent)
+            component = ec.read_manifest(manifest.parent)
+        else:
+            backend = config.get('backend') or None
+            slot = component_slot(root, config)
+            component = ec.resolve(store / slot, backend=backend, full=True)
+        ec.verify_signature(component, {**os.environ, 'STRATA_REQUIRE_SIGNED_COMPONENTS': '1'})
+        choices[path] = component.root
+    if choices:
+        activate_components(root, choices)
 
 
 def require_engine_result(result):
@@ -353,19 +427,12 @@ def update_signed_components(root, log=print):
         update_deepseek_components(root, deepseek, log)
     groups = {}
     for path, cfg in configs.items():
-        if is_deepseek_config(cfg):
+        if is_deepseek_config(cfg) or is_shape_config(cfg) or is_external_config(cfg):
             continue
         backend = cfg.get('backend') or None
         if backend and backend not in ('cuda', 'hip', 'sycl', 'metal', 'cpu', 'vulkan'):
             raise RuntimeError(f'未知引擎后端 {backend}：{path}')
-        slot = backend or 'auto'
-        adapted = resolve_launch_config(cfg, root)
-        try:
-            relative = Path(adapted['exe']).resolve().relative_to(root / '.strata-launcher-components')
-            if relative.parts[0] in ('auto', 'cuda', 'hip', 'sycl', 'metal', 'cpu', 'vulkan'):
-                slot = relative.parts[0]
-        except ValueError:
-            pass
+        slot = component_slot(root, cfg)
         groups.setdefault((slot, backend), []).append(path)
     if not groups:
         log('[更新] DeepSeek 独立引擎已处理，无需更新 Qwen 引擎。' if deepseek else

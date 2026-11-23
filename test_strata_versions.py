@@ -123,15 +123,14 @@ class VersionsTest(unittest.TestCase):
                 extract_source(archive, root / 'source')
             self.assertFalse((root / 'escape.py').exists())
 
-    def test_exact_engine_rejects_newer_engine(self):
+    def test_engine_version_is_independent_of_source(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self.tree(Path(tmp), 'source')
             exe = root / 'strata.exe'
             exe.touch()
             with patch('strata_versions.engine_targets', return_value={exe: 'cuda'}), \
                  patch('strata_versions.component_metadata', return_value={'version': '0.1.57'}):
-                with self.assertRaises(RuntimeError):
-                    check_exact_engines(root)
+                self.assertEqual(check_exact_engines(root), ['strata.exe: 0.1.57'])
 
     def test_release_feed_never_points_to_latest(self):
         self.assertIn('/download/v0.2.6/', pinned_feed('0.2.6'))
@@ -209,3 +208,58 @@ class VersionsTest(unittest.TestCase):
             self.assertFalse(app.runtime['updating'])
             self.assertTrue(any('[安装失败]' in line for line in logs))
             self.assertTrue((original / 'setup.py').is_file())
+
+
+def test_0215_control_version_does_not_reject_signed_release_engine(tmp_path, monkeypatch):
+    import strata_versions as versions
+    (tmp_path / 'CMakeLists.txt').write_text('project(strata VERSION 0.1.61)')
+    exe = tmp_path / 'strata-engine.exe'
+    exe.touch()
+    monkeypatch.setattr(versions, 'engine_targets', lambda root: [exe])
+    monkeypatch.setattr(versions, 'component_metadata', lambda path: {'version': '0.1.60'})
+    assert versions.check_exact_engines(tmp_path, '0.2.15') == ['strata-engine.exe: 0.1.60']
+
+
+def test_prune_keeps_current_and_model_data(tmp_path):
+    from strata_versions import VersionStore
+    store = VersionStore(tmp_path)
+    active, old, with_models = [store.root / name for name in
+                                ('release-active', 'release-old', 'release-models')]
+    for env in (active, old, with_models):
+        env.mkdir()
+        (env / 'setup.py').touch()
+        (env / 'CMakeLists.txt').write_text('project(strata VERSION 0.1.60)')
+        store.register(env, '0.2.14', verified=True)
+    (with_models / 'models').mkdir()
+    store.activate(old)
+    store.activate(active)
+    store.prune()
+    assert active.exists() and with_models.exists() and not old.exists()
+    assert not store.state()['previous']
+
+def test_launch_rehomes_deleted_release_log(tmp_path):
+    from strata_launch_support import resolve_launch_config
+    previous = tmp_path / '.strata-versions' / 'release-0.2.11-old'
+    current = tmp_path / '.strata-versions' / 'release-0.2.15-new'
+    current.mkdir(parents=True)
+    config = dict(exe='component:strata-engine', args=[], cwd=str(current),
+                  log=str(previous / 'strata-model.log'))
+    resolved = resolve_launch_config(config, current)
+    assert resolved['log'] == str(current / 'strata-model.log')
+    with open(resolved['log'], 'a', encoding='utf-8') as stream:
+        stream.write('vision ready')
+    assert config['log'] == str(previous / 'strata-model.log')
+
+def test_deleted_release_profile_is_removed_and_bundled_resources_rebased(tmp_path):
+    from strata_launch_support import resolve_launch_config
+    root = tmp_path / '.strata-versions' / 'release-new'
+    root.mkdir(parents=True)
+    (root / 'data').mkdir()
+    (root / 'data' / 'tokenizer.json').write_text('{}')
+    old = tmp_path / '.strata-versions' / 'release-old'
+    config = dict(exe='strata.exe', cwd=str(root), args=[
+        '--expert-profile', str(old / 'data' / 'expert-profile.bin'),
+        '--tokenizer', str(old / 'data' / 'tokenizer.json')])
+    result = resolve_launch_config(config, root)
+    assert '--expert-profile' not in result['args']
+    assert result['args'] == ['--tokenizer', str(root / 'data' / 'tokenizer.json')]

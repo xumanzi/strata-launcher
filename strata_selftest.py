@@ -41,11 +41,13 @@ def run_context_selftest(log=None):
     from strata_catalog import bundled_tables, family_models
     try:
         models, families, contexts = bundled_tables()
-        checks.append(('内置完整官方模型目录', 'deepseek41' in families and 'qwen36' in families
+        checks.append(('内置完整官方模型目录', 'qwen36' in families
                        and sum(len(family_models(models, f)) for f in families) >= 25))
-        checks.append(('DeepSeek 独立规格与上下文', all(row.get('multi_file') and row.get('contexts') == [8192]
-                       for row in family_models(models, 'deepseek41').values())
-                       and len(family_models(models, 'deepseek41')) >= 4))
+        for family, builds in (('hy4-flash', {'SQ-64', 'SQ-96', 'SQ-128'}),
+                               ('inkling-2-mini', {'SQ-10', 'SQ-15', 'SQ-20'})):
+            rows = family_models(models, family)
+            checks.append((f'{family} 独立规格与上下文', builds <= rows.keys()
+                           and all(rows[build]['shape_engine'] and rows[build]['contexts'] for build in builds)))
     except (OSError, ValueError, KeyError):
         checks.append(('内置完整官方模型目录', False))
     failures = [name for name, ok in checks if not ok]

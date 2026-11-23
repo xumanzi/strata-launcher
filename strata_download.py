@@ -2,6 +2,7 @@
 import concurrent.futures
 import json
 import http.client
+import inspect
 import runpy
 import sys
 import threading
@@ -204,6 +205,14 @@ def install_transport(transfer, threshold=16*1024*1024):
         print(json.dumps({'event': 'phase', 'message': '此版官方传输接口不适用加速，继续使用原下载器。'}, ensure_ascii=False), flush=True)
         return
     original = transfer._transfer
+    try:
+        parameters = tuple(inspect.signature(original).parameters)
+    except (TypeError, ValueError):
+        parameters = ()
+    # Releases with a pre-opened response or new options must keep the official transfer.
+    if parameters != ('location', 'partial', 'have', 'size', 'progress', 'cancel', 'timeout'):
+        print(json.dumps({'event': 'phase', 'message': '使用此发行版自带的下载器。'}, ensure_ascii=False), flush=True)
+        return
 
     def accelerated(location, partial, have, size, progress, cancel, timeout):
         if size-have < threshold or transfer.kind_of(location) not in ('http', 'https'):

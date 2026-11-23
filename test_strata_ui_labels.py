@@ -6,6 +6,7 @@ import strata_launcher as launcher
 class FriendlyLabelTests(unittest.TestCase):
     def test_runtime_modes_use_plain_language_labels(self):
         self.assertEqual(launcher.RUNTIME_MODE_LABELS, {
+            'speed': '速度优先（已调优）',
             'single': '单任务优先（推荐）',
             'concurrent': '多任务同时运行',
             'session': '长对话快速恢复（高级）',
@@ -20,6 +21,7 @@ class FriendlyLabelTests(unittest.TestCase):
 
     def test_thinking_labels_are_beginner_friendly(self):
         self.assertEqual(launcher.THINKING_LABELS, {
+            'none': '关闭思考（最快）',
             'high': '深入思考',
             'medium': '均衡思考',
             'low': '快速回答',

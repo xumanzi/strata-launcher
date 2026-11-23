@@ -44,21 +44,24 @@ from strata_download import download_source
 from strata_versions import (VersionStore, normalize_release, pinned_feed, extract_source,
                              copy_configs, check_exact_engines, source_engine_version, validate_config_flags)
 from strata_catalog import official_tables, family_models, bundled_tables, adapt_install_args
-from strata_update import installed_release, record_release, verify_engines, SOURCE_MARKER, launcher_update_lock
+from strata_update import installed_release, record_release, verify_engines, SOURCE_MARKER, launcher_update_lock, is_shape_config
 from strata_chat_template import apply_chat_template, validate_template
-from strata_local_import import inspect_model, apply_runtime_vision, projection_setup_args, find_huihui_vector
+from strata_launcher_release import check_launcher_release, stage_launcher, RELEASES as LAUNCHER_RELEASES
+from strata_install import (AUXILIARY_LABELS, HUIHUI_REPO, HUIHUI_FILE, INKLING_GGUF_AUX,
+                            auxiliary_roles, community_manifest, take_auxiliaries)
+from strata_local_import import inspect_model, preview_model, apply_runtime_vision, projection_setup_args, find_huihui_vector
 from strata_optimization import apply_runtime_optimization, model_settings
 from strata_model_cleanup import build_cleanup_plan, execute_cleanup_plan
 from strata_responsive import initial_geometry, layout_mode, monitor_workareas, restore_geometry
 from strata_launch_support import (http_probe, port_in_use, port_owner,
     kill_pid_force, is_protected_process, resolve_launch_config, prepare_engine_paths,
-    api_model_name, connection_fields, configured_lan_ipv4, local_context_choices, save_local_context,
+    api_model_name, connection_fields, configured_lan_ipv4, local_context_choices, save_local_context, normalize_llamacpp_config,
     strata_health_ready)
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog
 
 # --------------------------------------------------------------------------- 依赖自举
-REQUIRED_PACKAGES = {"customtkinter": "customtkinter", "jinja2": "jinja2"}
+REQUIRED_PACKAGES = {"customtkinter": "customtkinter", "jinja2": "jinja2", "psutil": "psutil"}
 
 
 def _auto_install_dependencies():
@@ -97,18 +100,26 @@ def _auto_install_dependencies():
 _auto_install_dependencies()
 
 import customtkinter as ctk  # noqa: E402
+import psutil  # noqa: E402
+
+if os.name == "nt" and getattr(sys, "frozen", False):
+    # External tools must use their own DLLs, not the bootloader's DLL directory.
+    if not ctypes.windll.kernel32.SetDllDirectoryW(None):
+        raise ctypes.WinError()
 
 # --------------------------------------------------------------------------- 常量
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 LAUNCHER_CONFIG = Path.home() / ".strata_launcher_config.json"
-APP_NAME = "AI蛮子 Strata 全模型启动器 V3.5.1"
+UPDATE_HELPERS = Path(sys._MEIPASS) / "update_helpers" if getattr(sys, "frozen", False) else APP_DIR
+APP_VERSION = "3.7.17"
+APP_NAME = f"AI蛮子 Strata 全模型启动器 V{APP_VERSION}"
 GITHUB_REPO = "Niko1221/Strata"
 GITHUB_LATEST_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 GITHUB_MAIN_ZIP = f"https://github.com/{GITHUB_REPO}/archive/refs/heads/main.zip"
 STRATA_ZIP_URL = GITHUB_MAIN_ZIP
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases"
-KNOWN_LATEST = "0.2.6"          # 内置官方发布版本
-SCAN_CACHE_VERSION = 5           # 模型清单缓存格式版本：升级后首次启动会自动后台刷新一次
+KNOWN_LATEST = "0.2.20"          # 内置官方发布版本
+SCAN_CACHE_VERSION = 7           # 模型清单缓存格式版本
 HF_MIRROR = "https://hf-mirror.com"
 
 FONT = "Microsoft YaHei UI"
@@ -151,7 +162,7 @@ FALLBACK_MODELS = {
                   "download_gb": 93.7, "ram_gb": 48, "arena_gb": 59.5, "families": ("unsloth",), "budget": True,
                   "vision": True},
 }
-FALLBACK_CONTEXTS = [8192, 32768, 65536, 131072, 262144, 393216, 524288]
+FALLBACK_CONTEXTS = [8192, 32768, 65536, 131072, 262144, 393216, 524288, 655360, 786432, 917504, 1048576]
 
 VISION_CHOICES = [("关闭（不读图）", "no"), ("GPU 上读图（推荐）", "gpu"), ("CPU 上读图（省显存）", "cpu")]
 QUARK_MODEL_URL = "https://pan.quark.cn/s/51ce260152fa"
@@ -167,11 +178,13 @@ DRAFT_CHOICES = [("cjk（中/日/韩，默认）", "cjk"), ("en（仅英文与�
 KVSTREAM_CHOICES = [("auto（自动判断）", "auto"), ("on（开启）", "on"), ("off（关闭）", "off")]
 ROPE_CHOICES = [("yarn（官方默认）", "yarn"), ("linear（位置插值）", "linear")]
 THINKING_LABELS = {
+    "none": "关闭思考（最快）",
     "high": "深入思考",
     "medium": "均衡思考",
     "low": "快速回答",
 }
 RUNTIME_MODE_LABELS = {
+    "speed": "速度优先（已调优）",
     "single": "单任务优先（推荐）",
     "concurrent": "多任务同时运行",
     "session": "长对话快速恢复（高级）",
@@ -271,6 +284,8 @@ class AppConfig:
         "install_vram_reserve": "500",
         "install_parallel": "",
         "install_draft_vocab": "cjk",
+        "install_drafting": "auto",
+        "install_all_drafters": False,
         "install_kv_streaming": "auto",
         "install_advanced_open": False,
         "context_compress_enabled": True,   # 自动接入独立摘要服务；保留用户关闭选择
@@ -676,7 +691,7 @@ class StrataEnv:
         if meipass:
             bases.append(Path(meipass))
         for base in bases:
-            for name in ("Strata-main.zip", "main.zip", "strata-src.zip"):
+            for name in ("Strata-baseline-0.2.20.zip", "Strata-baseline-0.2.19.zip", "Strata-main.zip", "main.zip", "strata-src.zip"):
                 p = base / name
                 if p.is_file():
                     return p
@@ -698,7 +713,7 @@ class StrataEnv:
         shutil.move(str(src), str(dest))
         if tmp.exists():
             shutil.rmtree(tmp, ignore_errors=True)
-        return dest
+        return dest / 'terminal' if (dest / 'terminal' / 'setup.py').is_file() else dest
 
     def download(self, url, dest_file, on_line=lambda s: None):
         return download_source(url, dest_file, on_line)
@@ -801,6 +816,7 @@ class StrataEnv:
                 self._mod = mod
             except Exception as e:                 # noqa: BLE001
                 log_line(f"[warn] 读取 setup.py 常量失败，使用内置表：{e}")
+        contexts = sorted(set(contexts) | set(FALLBACK_CONTEXTS))
         self._tables = (models, families, contexts)
         return self._tables
 
@@ -970,6 +986,27 @@ class ServerProcess:
         self.host = "127.0.0.1"
         self.cfg_path = None
         self.gateway = None
+        self._backend_port = None
+        self._stopping_children = []
+        self._wait_for_ram = False
+
+    def _await_ram_recovery(self):
+        if not self._wait_for_ram:
+            return
+        deadline = time.monotonic() + 15
+        stable_since = time.monotonic()
+        baseline = psutil.virtual_memory().available
+        while time.monotonic() < deadline:
+            time.sleep(0.5)
+            now = time.monotonic()
+            available = psutil.virtual_memory().available
+            if abs(available - baseline) > 512 * 1024 ** 2:
+                stable_since, baseline = now, available
+            if now - stable_since >= 4:
+                self._wait_for_ram = False
+                self.log_queue.put(f'[memory] 旧引擎已退出，可用内存已稳定：{available / 1024 ** 3:.1f} GiB')
+                return
+        raise RuntimeError('旧引擎已退出，但可用内存仍在变化；请稍后再次启动。')
 
     def local_url(self):
         host = '127.0.0.1' if self.host in ('0.0.0.0', '::', '', 'localhost') else self.host
@@ -989,8 +1026,21 @@ class ServerProcess:
         from strata_migration import restore_legacy_patch
         self.log_queue = queue.Queue()
         logs = self.log_queue
+        if self.running() or self._stopping_children:
+            raise RuntimeError('上一轮模型服务尚未退出，请先停止服务。')
+        self._await_ram_recovery()
         restore_legacy_patch(env.root, logs.put)
+        from strata_native_inkling import migrate_config
+        migrate_config(cfg_path, env.root, env.python())
+        from strata_update import repair_active_configs
+        repair_active_configs(env.root, cfg_path)
         cfg = json.loads(Path(cfg_path).read_text(encoding="utf-8-sig"))
+        if cfg.get('launcher_native_build') or '/launcher-components/strata-inkling-' in str(cfg.get('exe', '')).replace('\\', '/'):
+            from strata_native_inkling import managed_engine
+            shared_data = data_dir or cfg.get('launcher_component_data') or (cfg.get('local_import') or {}).get('shared_data')
+            if not shared_data:
+                raise ValueError('此原生模型配置缺少组件数据目录，请重新导入。')
+            cfg['exe'] = str(managed_engine(shared_data))
         self.cfg_path = Path(cfg_path).resolve()
         self.port = int(cfg.get('port') or 8080)
         self.host = cfg.get('host') or '127.0.0.1'
@@ -999,6 +1049,9 @@ class ServerProcess:
             backend_port = sock.getsockname()[1]
         temp = tempfile.TemporaryDirectory(prefix='strata-service-')
         runtime = Path(temp.name) / self.cfg_path.name
+        llama_backend = False
+        if cfg.get('engine') == 'llama.cpp':
+            raise ValueError('此模型尚未迁移到 Strata，请重新导入。')
         resolved = resolve_launch_config(cfg, env.root)
         resolved = apply_runtime_vision(resolved, env.root, bool(vision_enabled))
         try:
@@ -1018,7 +1071,10 @@ class ServerProcess:
                 temp.cleanup()
                 raise
         logs.put('[optimization] ' + '；'.join(optimization_notes))
-        if vision_enabled and not resolved.get('vision'):
+        native_vision = is_shape_config(resolved) and '--vision' in resolved.get('args', [])
+        if native_vision:
+            logs.put('[vision] 使用模型独立引擎的原生读图配置。')
+        elif vision_enabled and not resolved.get('vision'):
             logs.put('[vision] 已开启视觉模型，但当前配置缺少视觉引擎或 mmproj；本次以文字模式启动。')
         elif vision_enabled:
             logs.put('[vision] 视觉模型已开启，引擎将使用 --vision 启动。')
@@ -1027,6 +1083,15 @@ class ServerProcess:
         native = prepare_engine_paths(resolved)
         if cfg.get('local_import'):
             native['model_name'] = api_model_name(cfg)
+        from strata_launch_support import check_launch_headroom, cuda_headroom
+        try:
+            reserve_check = check_launch_headroom(native, logs.put)
+        except Exception:
+            temp.cleanup()
+            raise
+        if llama_backend:
+            available = psutil.virtual_memory().available / 1024**3
+            logs.put(f"[memory] 系统可用内存 {available:.1f} GiB；实际 KV、读图及 DSpark 占用由引擎报告。")
         self.active_config = dict(native)
         if native.get('args') != cfg.get('args'):
             logs.put('[path] 已转换为引擎兼容路径；原模型文件和配置保留。')
@@ -1040,7 +1105,9 @@ class ServerProcess:
                 shared = json.loads(settings.read_text(encoding='utf-8-sig'))
             except (OSError, ValueError):
                 logs.put('[optimization] 原共享设置无法解析，本次使用思考强度预设。')
-        shared.update(model_settings(optimization))
+        defaults = ({'reasoning_effort': 'none'} if llama_backend or native.get('arch') == 'inkling2_loop'
+                    else model_settings(optimization))
+        shared.update(defaults)
         runtime.with_suffix('.shared-settings.json').write_text(
             json.dumps(shared, ensure_ascii=False, indent=1), encoding='utf-8')
         full_env = os.environ.copy()
@@ -1058,15 +1125,22 @@ class ServerProcess:
                 trusted_origins=cfg.get('trusted_origins') if isinstance(cfg.get('trusted_origins'), list) else [],
                 summary_timeout=cfg.get('context_summary_timeout_seconds', 600),
                  web_root=env.root / 'serve' / 'web',
-                 thinking_default=model_settings(optimization)['reasoning_effort'])
-            cmd = [env.python(), str(env.root / 'serve/server.py'), '--engine', 'strata',
-                   '--config', str(runtime), '--host', '127.0.0.1', '--port', str(backend_port)]
+                 thinking_default=defaults['reasoning_effort'], llama_backend=llama_backend,
+                 model_name=native.get('model_name') or '')
+            if reserve_check is not None:
+                gateway.launch_ready = threading.Event()
+            if llama_backend:
+                cmd = [native["exe"], *native["args"], "--host", "127.0.0.1", "--port", str(backend_port)]
+            else:
+                cmd = [env.python(), str(env.root / 'serve/server.py'), '--engine', 'strata',
+                       '--config', str(runtime), '--host', '127.0.0.1', '--port', str(backend_port)]
             creation = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             proc = subprocess.Popen([str(c) for c in cmd], cwd=str(env.root), env=full_env,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                 encoding='utf-8', errors='replace', bufsize=1, creationflags=creation)
             self.proc, self.gateway = proc, gateway
             gateway.start()
+            self._backend_port = backend_port
         except Exception:
             if proc and proc.poll() is None:
                 proc.terminate()
@@ -1076,7 +1150,7 @@ class ServerProcess:
                 gateway.stop()
             temp.cleanup()
             raise
-        logs.put(f'[context] 独立摘要服务 {self.host}:{self.port} → 本机 Strata:{backend_port}')
+        logs.put(f'[context] 独立摘要服务 {self.host}:{self.port} → 本机后端:{backend_port}')
         def pump():
             try:
                 for line in proc.stdout:
@@ -1090,6 +1164,34 @@ class ServerProcess:
                 logs.put('__EXIT__')
         self._pump_thread = threading.Thread(target=pump, daemon=True)
         self._pump_thread.start()
+        if reserve_check is not None:
+            def verify_memory():
+                for _ in range(300):
+                    if proc.poll() is not None:
+                        return
+                    status, body = http_probe(f"http://127.0.0.1:{backend_port}/health")
+                    if strata_health_ready(status, body, llama_backend=llama_backend):
+                        memory = cuda_headroom()
+                        if memory is None or memory[0] < reserve_check:
+                            measured = f"{memory[0]} MiB" if memory else "不可读"
+                            logs.put(f"[memory] 本次启动已停止：加载后 CUDA 空闲显存 {measured}，"
+                                     f"要求至少 {reserve_check} MiB。请释放显存后重试。")
+                            try:
+                                proc.terminate()
+                            except OSError:
+                                pass
+                            return
+                        logs.put(f"[memory] 加载后已验证 CUDA 空闲显存 {memory[0]} MiB。")
+                        gateway.launch_ready.set()
+                        return
+                    threading.Event().wait(1)
+                logs.put("[memory] 等待模型就绪超时，未通过显存预留检查。")
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+
+            threading.Thread(target=verify_memory, daemon=True).start()
         if open_browser and cfg.get('open_browser') is not False:
             url = self.local_url()
             def browser_ready():
@@ -1098,7 +1200,7 @@ class ServerProcess:
                     if proc.poll() is not None:
                         return
                     status, body = http_probe(url + '/health')
-                    if strata_health_ready(status, body):
+                    if strata_health_ready(status, body, llama_backend=llama_backend):
                         import webbrowser
                         webbrowser.open(url + '/?strata-ui=' + str(time.time_ns()))
                         return
@@ -1114,15 +1216,54 @@ class ServerProcess:
     def stop(self):
         p = self.proc
         if p and p.poll() is None:
+            try:
+                self._stopping_children = psutil.Process(p.pid).children(recursive=True)
+            except psutil.NoSuchProcess:
+                pass
+            port = self._backend_port
+            if port is not None:
+                # Strata unloads idle engines via QUIT, which saves the expert ranking.
+                headers = {'Content-Type': 'application/json'}
+                if self.active_api_key:
+                    headers['Authorization'] = 'Bearer ' + self.active_api_key
+                request = urllib.request.Request(
+                    f'http://127.0.0.1:{port}/v1/unload', data=b'{}', headers=headers)
+                try:
+                    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                    with opener.open(request, timeout=4):
+                        pass
+                except OSError:
+                    # Older or busy backends still use the existing shutdown path.
+                    pass
             if os.name == 'nt':
                 subprocess.run(['taskkill', '/F', '/T', '/PID', str(p.pid)],
-                    capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                    capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=8)
             else:
                 p.terminate()
+        if p:
+            p.wait(timeout=8)
+            if self._stopping_children:
+                # Windows taskkill can finish the parent while a captured child
+                # is still exiting. Use the process identity captured before stop.
+                for child in self._stopping_children:
+                    try:
+                        child.kill()
+                    except psutil.NoSuchProcess:
+                        pass
+                _, self._stopping_children = psutil.wait_procs(self._stopping_children, timeout=8)
+            pump = getattr(self, '_pump_thread', None)
+            if pump and pump is not threading.current_thread():
+                pump.join(8)
+                if pump.is_alive():
+                    raise RuntimeError('旧服务尚未释放端口，请稍后再试。')
+            if self._stopping_children:
+                raise RuntimeError('旧模型引擎仍在退出，暂缓启动新模型。')
+            self._wait_for_ram = True
         self.proc = None
+        self._backend_port = None
 
     def running(self):
-        return self.proc is not None and self.proc.poll() is None
+        return bool(self._stopping_children) or (self.proc is not None and self.proc.poll() is None)
 
 
 # --------------------------------------------------------------------------- 界面辅助
@@ -1215,6 +1356,7 @@ class StrataLauncher(ctk.CTk):
         self.after(150, self._pump_ui_queue)
         self.after(200, self.bootstrap)
         self.after(1500, self._tick)
+        self.after(6000, self._poll_launcher_release)
 
     # ---------------- 顶部
     def _build_header(self):
@@ -1250,7 +1392,7 @@ class StrataLauncher(ctk.CTk):
         self.sidebar.pack_propagate(False)
         self.nav_buttons = {}
         items = [("dashboard", "概览"), ("install", "安装 / 模型"), ("network", "网络与配置"),
-                 ("tools", "维护工具"), ("help", "使用帮助")]
+                 ("tools", "维护工具"), ("help", "软件更新说明")]
         for key, text in items:
             btn = ctk.CTkButton(self.sidebar, text=text, anchor="w", height=38, corner_radius=8,
                                 fg_color="transparent", text_color=COLORS["text"], hover_color=COLORS["chip"],
@@ -1443,6 +1585,8 @@ class StrataLauncher(ctk.CTk):
             ch = self.env.config_choices(c) or {}
             if ch.get('model') and not scanned.get('local_import'):
                 label = f"{label or c.stem} · {ch['model']}"
+            if scanned.get('launcher_unrestricted') or re.search(r'abliterat|uncensored|unrestricted|无限制|破限', label or '', re.I):
+                label = f"{label or c.stem} · 无限制模型"
             seen.add((ch.get("family"), ch.get("model")))
             out.append({"label": label or c.stem, "path": str(c),
                         "family": ch.get("family"), "model": ch.get("model"),
@@ -1870,7 +2014,17 @@ class StrataLauncher(ctk.CTk):
     def _model_optimization(self, path=None):
         path = path or self._selected_cfg_path()
         saved = self.cfg.get('model_optimizations') or {}
-        return dict(saved.get(str(path.resolve()), {})) if path else {}
+        if not path:
+            return {}
+        options = dict(saved.get(str(path.resolve()), {}))
+        try:
+            model = json.loads(path.read_text(encoding='utf-8-sig'))
+        except (OSError, ValueError):
+            model = {}
+        if model.get('launcher_speed_priority'):
+            options = dict({'mode':'speed', 'effort':'none', 'budget':0, 'spec':'4',
+                            'profile':False, 'kv_resident':65536, 'kv_precision':'int8'}, **options)
+        return options
 
     def _load_model_optimization(self):
         if hasattr(self, 'chat_template_var'):
@@ -1955,6 +2109,9 @@ class StrataLauncher(ctk.CTk):
             self._refresh_chat_template()
 
     def start_model(self):
+        if self.runtime.get('updating'):
+            self.toast('正在更新', '请等待版本更新与模型恢复完成。', 'warn')
+            return
         if getattr(self, "_starting", False):
             self.toast("正在启动", "正在准备模型服务，请稍候。")
             return
@@ -2029,7 +2186,7 @@ class StrataLauncher(ctk.CTk):
             self.dash_log.append(f"已强制结束 {desc}，端口 {port} 已释放，继续用原端口启动。")
         self.dash_log.clear()
         self.dash_log.append("正在启动模型服务…")
-        self.dash_log.append("首次加载会把 34-55 GB 读入内存，期间电脑可能卡顿 1-3 分钟，属正常现象。")
+        self.dash_log.append("首次加载所需内存取决于模型、上下文和辅助权重。请查看下方资源检查和引擎日志。")
         policy = {"context_compress_enabled": bool(self.compress_var.get()),
                   "fit_max_tokens": bool(self.fit_var.get())}
         browser = bool(self.cfg.get('open_browser'))
@@ -2089,6 +2246,21 @@ class StrataLauncher(ctk.CTk):
         threading.Thread(target=worker, daemon=True, name='strata-launch').start()
 
     # ---------------- 配置生成（为已下载 / 路径失效的模型重写官方配置）
+    def _selected_inkling_kv(self):
+        """KV precision for Strata's Inkling runner, from the install page selection."""
+        raw = None
+        if hasattr(self, "kv_var"):
+            try:
+                raw = self.kv_var.get()
+            except Exception:
+                raw = None
+        raw = raw or self.cfg.get("install_kv") or "int8"
+        from strata_native_inkling import inkling_kv, INKLING_KV_FALLBACK
+        try:
+            return inkling_kv(raw)
+        except ValueError:
+            return INKLING_KV_FALLBACK
+
     def _generate_config(self, ent, title, intro, ctx=None):
         """调用官方 setup.py 生成或重写配置；已下载的模型文件会被复用。"""
         if self.env.root is None:
@@ -2121,6 +2293,8 @@ class StrataLauncher(ctk.CTk):
             return
         args = ["--yes", "--family", fam, "--model", spec, "--context", str(ctx), "--no-start"]
         args = adapt_install_args(args, md)
+        if fam == 'inkling-2-mini':
+            args += ['--launcher-inkling-kv', self._selected_inkling_kv()]
         if dd:
             args += ["--data-dir", dd]
         self.cfg.set("last_context", ctx)
@@ -2181,7 +2355,7 @@ class StrataLauncher(ctk.CTk):
         if self.server.running():
             self.dash_log.append("正在重启…")
             self.server.stop()
-            self.after(1200, self.start_model)
+            self.after_idle(self.start_model)
         else:
             self.start_model()
 
@@ -2395,42 +2569,37 @@ class StrataLauncher(ctk.CTk):
         page.grid_columnconfigure(0, weight=1)
         self.install_page = page
 
-        download_card = make_card(page, "网盘模型下载")
-        download_card.pack(fill="x", pady=(0, 12))
-        ctk.CTkLabel(download_card, text="AI蛮子-Qwen3.8-Flash-Next-Strata启动器",
-            text_color=COLORS["text"], font=ctk.CTkFont(family=FONT, size=13, weight="bold"),
-            anchor="w").pack(fill="x", padx=16, pady=(0, 5))
-        ctk.CTkLabel(download_card, text=f"下载链接：{QUARK_MODEL_URL}\n提取码：{QUARK_MODEL_CODE}",
-            text_color=COLORS["text"], font=ctk.CTkFont(family=FONT_MONO, size=12),
-            justify="left", anchor="w").pack(fill="x", padx=16, pady=(0, 8))
-        download_row = ctk.CTkFrame(download_card, fg_color="transparent")
-        download_row.pack(fill="x", padx=16, pady=(0, 12))
-        ctk.CTkButton(download_row, text="打开网盘下载", width=130,
-            command=self.open_quark_model_download, fg_color=COLORS["accent"]).pack(side="left")
-        ctk.CTkButton(download_row, text="复制链接", width=100, fg_color=COLORS["chip"],
-            text_color=COLORS["text"],
-            command=lambda: self.copy_download_info(QUARK_MODEL_URL, "链接")).pack(side="left", padx=8)
-        ctk.CTkButton(download_row, text="复制提取码", width=110, fg_color=COLORS["chip"],
-            text_color=COLORS["text"],
-            command=lambda: self.copy_download_info(QUARK_MODEL_CODE, "提取码")).pack(side="left")
+        navigation = ctk.CTkFrame(page, fg_color="transparent")
+        navigation.pack(fill="x", pady=(0, 12))
+        self.install_tabs = {}
+        self.install_section = "local" if self.current_mode() != "installed" else "installed"
+        for key, caption in (("download", "从启动器下载"), ("local", "导入本地 GGUF"), ("installed", "已安装模型")):
+            button = ctk.CTkButton(navigation, text=caption, width=128,
+                                   command=lambda tab=key: self._show_install_section(tab))
+            button.pack(side="left", padx=(0, 8))
+            self.install_tabs[key] = button
 
-        local_card = make_card(page, "已有 GGUF 文件？从电脑导入模型")
-        local_card.pack(fill="x", pady=(0, 12))
-        ctk.CTkLabel(local_card, text=(
-            "1. 点击下方按钮，选择放着同一个模型全部 .gguf 分片的文件夹。\n"
-            "   例如 models\\IQ3_XXS 破限；不要选 models 总目录，也不用逐个选文件。\n"
-            "2. 填写容易区分的名称，确认后等待准备完成；模型文件会直接使用，不再下载。\n"
-            "3. 完成后到「概览」选择这个名称，点击「启动模型」。原版与破限版可分别使用。\n"
-            "支持 Qwen3.8-Flash-Next GSQ-RCO 分片模型。首次准备可能联网补齐引擎或辅助资源。"),
-            justify="left", wraplength=820, text_color=COLORS["text"],
-            font=ctk.CTkFont(family=FONT, size=12)).pack(anchor="w", padx=16, pady=(0, 8))
-        local_row = ctk.CTkFrame(local_card, fg_color="transparent")
-        local_row.pack(fill="x", padx=16, pady=(0, 12))
-        self.local_import_btn = ctk.CTkButton(local_row, text="导入本地 GGUF 模型…", width=190,
-            command=self.import_local_model, fg_color=COLORS["accent"])
-        self.local_import_btn.pack(side="left")
-        ctk.CTkButton(local_row, text="查看新手说明", width=130, fg_color=COLORS["chip"],
-            text_color=COLORS["text"], command=self.show_local_import_help).pack(side="left", padx=8)
+        self.local_card = make_card(page, "导入本地 GGUF")
+        self.local_source = ctk.StringVar(value="")
+        self.local_selection = None
+        picker = ctk.CTkFrame(self.local_card, fg_color="transparent")
+        picker.pack(fill="x", padx=16, pady=(0, 8))
+        ctk.CTkButton(picker, text="选择 GGUF 文件…", width=140,
+                      command=lambda: self.select_local_import(True)).pack(side="left")
+        ctk.CTkButton(picker, text="选择模型文件夹…", width=140,
+                      command=lambda: self.select_local_import(False)).pack(side="left", padx=8)
+        ctk.CTkLabel(self.local_card, textvariable=self.local_source, justify="left", wraplength=660,
+                     anchor="w").pack(fill="x", padx=16, pady=(0, 8))
+        self.local_source.set("请选择主 GGUF 文件或包含完整分片的文件夹。")
+        local_vision = ctk.CTkFrame(self.local_card, fg_color="transparent")
+        local_vision.pack(fill="x", padx=16, pady=(0, 8))
+        self.local_vision = local_vision
+        ctk.CTkButton(local_vision, text="调整上下文和数据目录", width=156,
+                      command=lambda: self._show_install_section("download")).pack(side="right")
+        self.local_aux_panel = self._build_auxiliary_panel(self.local_card)
+        self.local_import_btn = ctk.CTkButton(self.local_card, text="检查并导入", width=135,
+                                              state="disabled", command=self.import_local_model)
+        self.local_import_btn.pack(anchor="w", padx=16, pady=(4, 12))
 
         # --- 模式 A：已安装
         self.installed_card = make_card(page, "已安装的模型")
@@ -2447,7 +2616,7 @@ class StrataLauncher(ctk.CTk):
         ctk.CTkButton(arow, text="再装一个模型 / 改设置", width=190, height=34, corner_radius=8,
                       fg_color=COLORS["chip"], text_color=COLORS["text"], hover_color="#dde5f7",
                       font=ctk.CTkFont(family=FONT, size=12),
-                      command=self._force_fresh_wizard).pack(side="left", padx=8)
+                      command=lambda: self._show_install_section("download")).pack(side="left", padx=8)
 
         # --- 模式 B：安装向导
         self.wizard_card = make_card(page, "全新安装向导")
@@ -2488,16 +2657,6 @@ class StrataLauncher(ctk.CTk):
                                          font=ctk.CTkFont(family=FONT, size=11), wraplength=780)
         self.model_detail.pack(anchor="w", pady=(4, 0))
         self._on_family_change()
-        iq4 = ctk.CTkFrame(c, fg_color="transparent")
-        iq4.pack(fill="x", pady=(8, 0))
-        ctk.CTkButton(iq4, text="选择 IQ4 模型（UD-IQ4_XS）", width=220,
-                      command=self._select_iq4_install, fg_color=COLORS["accent"]).pack(side="left")
-        ctk.CTkButton(iq4, text="查看官方模型文件", width=140,
-                      fg_color=COLORS["chip"], text_color=COLORS["text"],
-                      command=lambda: __import__('webbrowser').open(IQ4_MODEL_URL)).pack(side="left", padx=8)
-        ctk.CTkLabel(c, text="IQ4 下载约 94 GB，需较大磁盘空间与内存；选择后按下方安装步骤下载。",
-                     text_color=COLORS["text_dim"], font=ctk.CTkFont(family=FONT, size=11),
-                     wraplength=780).pack(anchor="w", pady=(4, 0))
 
         # 4 上下文
         r, c = make_field(inner, "第 4 步 · 选择上下文长度",
@@ -2519,23 +2678,29 @@ class StrataLauncher(ctk.CTk):
         r, c = make_field(inner, "第 5 步 · 读图能力与 KV 缓存精度")
         r.pack(fill="x", pady=(0, 10))
         self.vision_var = ctk.StringVar(value=self.cfg.get("install_vision") or "gpu")
+        ctk.CTkLabel(self.local_vision, text="读图").pack(side="left", padx=(0, 8))
+        ctk.CTkOptionMenu(self.local_vision, variable=self.vision_var,
+                          values=["gpu", "cpu", "no"], width=110).pack(side="left")
+
         self.kv_var = ctk.StringVar(value=self.cfg.get("install_kv") or "int8")
         self._option_row(c, "读图", self.vision_var, VISION_CHOICES)
         self._option_row(c, "KV 精度", self.kv_var, KV_CHOICES)
-        self.esp_var = ctk.BooleanVar(value=bool(self.cfg.get("install_esp")))
-        ctk.CTkCheckBox(c, text="启用拒答方向投影（实验功能）", variable=self.esp_var,
-                        text_color=COLORS["text"], font=ctk.CTkFont(family=FONT, size=12),
-                        checkbox_width=20, checkbox_height=20).pack(anchor="w", pady=(6, 0))
-        vector_row = ctk.CTkFrame(c, fg_color="transparent")
-        vector_row.pack(fill="x", pady=(6, 0))
-        self.esp_path_var = ctk.StringVar(value=self.cfg.get("install_esp_path") or "")
-        ctk.CTkEntry(vector_row, textvariable=self.esp_path_var, width=430,
-                     placeholder_text="留空使用 Strata 默认向量，或选择 Huihui 方向文件").pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(vector_row, text="选择方向文件…", width=125,
-                      command=self.choose_projection_file).pack(side="left", padx=(8, 0))
-        ctk.CTkLabel(c, text="自定义文件需匹配 Qwen3.8-Flash-Next；改变拒答倾向，不降低内存需求。",
-                     text_color=COLORS["text_dim"], wraplength=700).pack(anchor="w", pady=(4, 0))
+        self.esp_var = ctk.BooleanVar(value=False)
+        self.esp_path_var = ctk.StringVar(value="")
 
+        self.download_aux_panel = self._build_auxiliary_panel(inner)
+        sources = ctk.CTkFrame(inner, fg_color="transparent")
+        sources.pack(fill="x", pady=8)
+        self.community_source_var = ctk.StringVar(value="官方模型")
+        ctk.CTkOptionMenu(sources, variable=self.community_source_var,
+                          values=["官方模型", "自定义链接", "GSQ-RCO · 完整破限权重", "Huihui 社区权重"],
+                          command=self._select_community_source, width=230).pack(anchor="w")
+        self.community_link = ctk.CTkEntry(sources, placeholder_text="Hugging Face 社区仓库或 GGUF 文件链接")
+        self.community_link.pack(fill="x", pady=6)
+        self.community_source_note = ctk.CTkLabel(sources, text="", anchor="w", wraplength=640, justify="left")
+        self.community_source_note.pack(fill="x")
+        ctk.CTkButton(sources, text="打开网盘来源", width=120,
+                      command=self.open_quark_model_download).pack(anchor="w", pady=4)
         # 6 端口与局域网
         r, c = make_field(inner, "第 6 步 · 端口与网络访问")
         r.pack(fill="x", pady=(0, 10))
@@ -2597,14 +2762,11 @@ class StrataLauncher(ctk.CTk):
         self._update_disk_note()
 
         # 高级
-        self.adv_open = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(inner, text="显示高级选项（低内存模式 / 多 GPU / 并行 / 显存预留 / 草稿词表）",
-                        variable=self.adv_open, text_color=COLORS["text"],
-                        font=ctk.CTkFont(family=FONT, size=12), checkbox_width=20, checkbox_height=20,
-                        command=self._toggle_advanced).pack(anchor="w", pady=(4, 6))
+        self.adv_open = ctk.BooleanVar(value=True)
         self.adv_frame = ctk.CTkFrame(inner, fg_color="#f8fafd", corner_radius=10, border_width=1,
                                       border_color=COLORS["border"])
         self._build_advanced(self.adv_frame)
+        self.adv_frame.pack(fill="x", pady=(4, 6))
 
         # 8 安装
         r, c = make_field(inner, "第 8 步 · 开始安装")
@@ -2626,10 +2788,18 @@ class StrataLauncher(ctk.CTk):
                         checkbox_width=20, checkbox_height=20,
                         command=lambda: self.cfg.set("use_hf_mirror", self.hf_var.get())).pack(side="left", padx=8)
 
+        controls = ctk.CTkFrame(page, fg_color="transparent")
+        self.install_log_anchor = controls
+        controls.pack(fill="x")
+        ctk.CTkButton(controls, text="取消当前任务", width=130, command=lambda: (
+            self.cancel_install() if self.runner.running() else None)).pack(anchor="w", pady=(0, 6))
         inst_log_card = make_card(page, "安装日志")
         inst_log_card.pack(fill="both", expand=True, pady=(0, 8))
         self.install_log = LogPane(inst_log_card, height=300)
         self.install_log.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        for var in (self.family_var, self.vision_var):
+            var.trace_add("write", lambda *_: self._refresh_auxiliary_panels())
+        self._show_install_section(self.install_section)
         return page
 
     def _option_row(self, parent, label, var, choices):
@@ -2691,6 +2861,15 @@ class StrataLauncher(ctk.CTk):
             corner_radius=8, fg_color=COLORS["chip"], text_color=COLORS["text"], button_color="#dde5f7",
             button_hover_color="#cfdaf5", dropdown_text_color=COLORS["text"],
             font=ctk.CTkFont(family=FONT, size=12)))
+        self.drafting_var = ctk.StringVar(value=self.cfg.get('install_drafting') or 'auto')
+        row(7, '草稿加速', lambda: ctk.CTkOptionMenu(
+            grid, variable=self.drafting_var, values=['auto', 'mtp', 'dflash2', 'off'],
+            width=260, height=30, corner_radius=8))
+        ctk.CTkLabel(grid, text='auto：按模型、引擎和并发选择；每次运行只加载一种草稿模型。',
+                     text_color=COLORS['text_dim'], wraplength=560).grid(row=8, column=1, sticky='w')
+        self.all_drafters_var = ctk.BooleanVar(value=bool(self.cfg.get('install_all_drafters')))
+        ctk.CTkCheckBox(grid, text='同时准备可兼容的 MTP 和 DFlash2（离线切换）',
+                       variable=self.all_drafters_var).grid(row=9, column=1, sticky='w', pady=6)
 
     def _toggle_advanced(self):
         if self.adv_open.get():
@@ -2703,6 +2882,7 @@ class StrataLauncher(ctk.CTk):
         self.cfg.set("mode", "fresh")
         self.apply_mode()
         self.show_page("install")
+        self._show_install_section("download")
 
     def _rebuild_family_radios(self):
         """按当前加载到的真实家族表重建单选项（首次构造时用的是内置兜底表）。"""
@@ -2777,15 +2957,17 @@ class StrataLauncher(ctk.CTk):
             bits.append('独立引擎；Windows 需 NVIDIA RTX 30/40/50 系列；至少 12GB 显存；不支持读图')
         elif d.get('nvidia_only'):
             bits.append('仅支持 NVIDIA 显卡')
+        elif d.get('shape_engine'):
+            bits.append('使用 Strata 官方独立引擎')
         elif d.get('own_path'):
             bits.append('支持 NVIDIA / AMD；当前不支持 Intel Arc')
         ctk_text = f"说明：{d.get('about', '')}\n" + ("　|　".join(bits) if bits else "")
         self.model_detail.configure(text=ctk_text)
         if hasattr(self, 'ctx_menu'):
-            contexts = d.get('contexts') or self.env.tables()[2]
+            contexts = sorted(set(d.get('contexts') or self.env.tables()[2]) | set(FALLBACK_CONTEXTS))
             self.ctx_menu.configure(values=[ctx_label(x) for x in contexts])
             if ctx_value(self.ctx_var.get()) not in contexts:
-                self.ctx_var.set(ctx_label(contexts[0]))
+                self.ctx_var.set(ctx_label(d.get('default_context', contexts[0])))
             self.ctx_note.configure(text=('DeepSeek 使用独立引擎；当前采用官方已验证的 8K 上下文，纯文字模式。'
                 if d.get('multi_file') else '安装选项会按所选模型适配；具体硬件支持由官方安装程序检查。'))
         self._update_disk_note()
@@ -2899,6 +3081,10 @@ class StrataLauncher(ctk.CTk):
             self.cfg.set("install_parallel", self.parallel_entry.get().strip())
         if hasattr(self, "draft_var"):
             self.cfg.set("install_draft_vocab", self.draft_var.get())
+        if hasattr(self, 'drafting_var'):
+            self.cfg.set('install_drafting', self.drafting_var.get())
+        if hasattr(self, 'all_drafters_var'):
+            self.cfg.set('install_all_drafters', bool(self.all_drafters_var.get()))
         if hasattr(self, "kvstream_var"):
             self.cfg.set("install_kv_streaming", self.kvstream_var.get())
         if hasattr(self, "adv_open"):
@@ -2925,7 +3111,7 @@ class StrataLauncher(ctk.CTk):
         if hasattr(self, "kv_var"):
             self.kv_var.set(self.cfg.get("install_kv") or "int8")
         if hasattr(self, "esp_var"):
-            self.esp_var.set(bool(self.cfg.get("install_esp")))
+            self.esp_var.set(False)
         if hasattr(self, "esp_path_var"):
             self.esp_path_var.set(self.cfg.get("install_esp_path") or "")
         if hasattr(self, "hf_var"):
@@ -2970,10 +3156,14 @@ class StrataLauncher(ctk.CTk):
             self._fill_entry(self.parallel_entry, self.cfg.get("install_parallel") or "")
         if hasattr(self, "draft_var"):
             self.draft_var.set(self.cfg.get("install_draft_vocab") or "cjk")
+        if hasattr(self, 'drafting_var'):
+            self.drafting_var.set(self.cfg.get('install_drafting') or 'auto')
+        if hasattr(self, 'all_drafters_var'):
+            self.all_drafters_var.set(bool(self.cfg.get('install_all_drafters')))
         if hasattr(self, "kvstream_var"):
             self.kvstream_var.set(self.cfg.get("install_kv_streaming") or "auto")
         if hasattr(self, "adv_open"):
-            self.adv_open.set(bool(self.cfg.get("install_advanced_open")))
+            self.adv_open.set(True)
         if hasattr(self, "lan_var"):
             self._on_lan_toggle()
         if hasattr(self, "net_lan_var"):
@@ -3042,10 +3232,11 @@ class StrataLauncher(ctk.CTk):
         self.hw_label.configure(text="\n".join(text))
 
     # ---- 安装
-    def _build_install_args(self):
-        models = self.env.models_for(self.family_var.get())
-        fam = self.family_var.get()
-        model = self.model_var2.get()
+    def _build_install_args(self, selection=None):
+        fam, model = selection or (self.family_var.get(), self.model_var2.get())
+        models = self.env.models_for(fam)
+        if model not in models:
+            raise ValueError("所选模型不属于当前模型家族，请重新选择模型。")
         ctx = ctx_value(self.ctx_var.get())
         if ctx is None:
             raise ValueError("上下文格式无法识别。")
@@ -3053,6 +3244,10 @@ class StrataLauncher(ctk.CTk):
         kv = self.kv_var.get()
         args = ["--yes", "--family", fam, "--model", model, "--context", str(ctx),
                 "--vision", vision, "--kv", kv, "--no-start"]
+        if fam == 'inkling-2-mini':
+            # Strata's Inkling runner only accepts its own KV names; setup.py's --kv is
+            # a llama.cpp-era flag and would be dropped on the native path.
+            args += ['--launcher-inkling-kv', self._selected_inkling_kv()]
 
         # 网络
         port = self.port_entry.get().strip() or "8080"
@@ -3076,8 +3271,7 @@ class StrataLauncher(ctk.CTk):
         args += ["--data-dir", dd]
 
         # 实验向量（默认关闭；仅在勾选时传递 on）
-        args += projection_setup_args(self.esp_var.get(),
-                                      self.esp_path_var.get() if hasattr(self, "esp_path_var") else '')
+        args += projection_setup_args(False, '')
 
         # 高级
         if self.adv_open.get():
@@ -3102,7 +3296,9 @@ class StrataLauncher(ctk.CTk):
             if vram:
                 if not vram.isdigit() or int(vram) < 0:
                     raise ValueError("显存预留必须是不小于 0 的整数（MiB）。")
-                args += ["--vram-reserve-mib", vram]
+                args += ["--vram-reserve-mib", str(max(500, int(vram)))]
+            else:
+                args += ["--vram-reserve-mib", "500"]
             par = self.parallel_entry.get().strip()
             if par:
                 if not par.isdigit() or int(par) < 1:
@@ -3137,7 +3333,7 @@ class StrataLauncher(ctk.CTk):
     def show_local_import_help(self):
         messagebox.showinfo("本地模型导入 · 新手说明",
             "GGUF 是模型文件，分片是一个大模型拆开的几份，必须全部放在同一个文件夹。\n\n"
-            "支持 GSQ-RCO Q2_0 / IQ2_XS / IQ3_XXS / IQ3_S、Coder IQ1_M，以及 UD-IQ4_XS / UD-Q4_K_XL。\n"
+            "按所选 Strata 版本检查模型架构、量化与分片；支持新版 Unsloth Dynamic v3.1、GSQ-RCO、Coder 等官方兼容模型。\n"
             "支持单文件或完整分片；普通 Q4_K_M 等量化尚不受 Strata 引擎支持。Q4 内存需求较高，32GB 内存不能保证运行。\n"
             "Coder 请选择含两个完整分片的 IQ1_M 文件夹；12GB 显存 + 32GB 内存建议先用 16K 上下文、关闭读图、低内存自动模式。\n\n"
             "你的两个模型需要分别导入：\n"
@@ -3152,7 +3348,160 @@ class StrataLauncher(ctk.CTk):
             "要修改导入模型的设置，请重新导入同一个文件夹。移动模型后也需要重新导入。"
             "导入失败时先看日志，检查分片是否下载完整、格式是否受支持。")
 
-    def import_local_model(self):
+    def _show_install_section(self, section):
+        self.install_section = section
+        panels = {"download": self.wizard_card, "local": self.local_card, "installed": self.installed_card}
+        for name, panel in panels.items():
+            panel.pack_forget()
+            self.install_tabs[name].configure(fg_color=COLORS["accent"] if name == section else COLORS["chip"],
+                                              text_color="white" if name == section else COLORS["text"])
+        panels[section].pack(fill="x", pady=(0, 12), before=self.install_log_anchor)
+        self._refresh_auxiliary_panels()
+
+    def _build_auxiliary_panel(self, parent):
+        panel = make_card(parent, "辅助模型")
+        panel.pack(fill="x", padx=8, pady=10)
+        rows = {}
+        for role, label in AUXILIARY_LABELS.items():
+            row = ctk.CTkFrame(panel, fg_color="transparent")
+            row.grid_columnconfigure(0, weight=1)
+            heading = ctk.CTkLabel(row, text=label, anchor="w")
+            heading.grid(row=0, column=0, sticky="ew", padx=8)
+            choices = ["自动匹配", "本地文件", "下载链接"]
+            if role != "engram":
+                choices.append("关闭")
+            mode = ctk.StringVar(value="自动匹配")
+            selector = ctk.CTkOptionMenu(row, variable=mode, values=choices, width=112)
+            selector.grid(row=0, column=1, padx=8)
+            entry = ctk.CTkEntry(row, placeholder_text="路径或 Hugging Face 文件链接")
+            entry.grid(row=1, column=0, sticky="ew", padx=8, pady=(4, 0))
+            browse = ctk.CTkButton(row, text="浏览…", width=90,
+                                   command=lambda field=entry: self._browse_auxiliary(field))
+            browse.grid(row=1, column=1, padx=8, pady=(4, 0))
+            rows[role] = (row, heading, mode, selector, entry, browse)
+            def update(*_, mode=mode, entry=entry, browse=browse):
+                entry.configure(state="normal" if mode.get() in ("本地文件", "下载链接") else "disabled")
+                browse.configure(state="normal" if mode.get() == "本地文件" else "disabled")
+            mode.trace_add("write", update)
+            update()
+        return rows
+
+    def _browse_auxiliary(self, entry):
+        file = filedialog.askopenfilename(parent=self, title="选择辅助模型",
+                    filetypes=[("模型文件", "*.gguf *.strata *.safetensors"), ("所有文件", "*")])
+        if file:
+            entry.delete(0, "end")
+            entry.insert(0, file)
+
+    def _refresh_auxiliary_panels(self):
+        info = self.local_selection[1] if self.local_selection else None
+        vision = self.vision_var.get()
+        groups = ((self.local_aux_panel, info["family"] if info else None),
+                  (self.download_aux_panel, self.family_var.get()))
+        for panel, family in groups:
+            supported = set(auxiliary_roles(family, "gpu")) if family else set()
+            active = set(auxiliary_roles(family, vision)) if family else set()
+            for role, (row, label, mode, selector, entry, browse) in panel.items():
+                row.pack_forget()
+                if family and role not in supported:
+                    continue
+                row.pack(fill="x", padx=8, pady=(0, 8))
+                label.configure(text=AUXILIARY_LABELS[role] + (
+                    "" if role in active else " · 开启读图后可用" if family else " · 请选择主模型"))
+                selector.configure(state="normal" if role in active else "disabled")
+                if role not in active:
+                    entry.configure(state="disabled")
+                    browse.configure(state="disabled")
+                else:
+                    entry.configure(state="normal" if mode.get() in ("本地文件", "下载链接") else "disabled")
+                    browse.configure(state="normal" if mode.get() == "本地文件" else "disabled")
+
+    def choose_install_auxiliaries(self, family, vision, *, local=False):
+        panel = self.local_aux_panel if local else self.download_aux_panel
+        args, remote, details = [], {}, []
+        try:
+            for role in auxiliary_roles(family, vision):
+                _, _, mode, _, entry, _ = panel[role]
+                value = entry.get().strip().strip('"')
+                description = "自动匹配，优先复用本地配套文件"
+                local_info = self.local_selection[1] if local and self.local_selection else {}
+                if local_info.get("format") == "inkling-gguf" and role in INKLING_GGUF_AUX:
+                    description += f"；缺少兼容文件时从 Unsloth 下载 {INKLING_GGUF_AUX[role]}"
+                if mode.get() in ("本地文件", "下载链接") and not value:
+                    raise ValueError(f"请填写{AUXILIARY_LABELS[role]}，或改用自动匹配。")
+                if mode.get() == "下载链接":
+                    remote[role] = community_manifest(value, auxiliary=True)
+                    row = remote[role][0]
+                    description = f"{row['name']} · {row['size'] / 1e9:.2f} GB · {value}"
+                elif mode.get() == "本地文件":
+                    args += ["--launcher-" + role, value]
+                    description = value
+                elif mode.get() == "关闭":
+                    if role in ("vision", "mmproj"):
+                        args.append("--launcher-disable-vision")
+                    elif role == "dspark":
+                        args.append("--launcher-disable-dspark")
+                    description = "关闭"
+                details.append(f"{AUXILIARY_LABELS[role]}：{description}")
+            take_auxiliaries(args)
+        except (ValueError, OSError) as error:
+            self.toast("辅助模型选择有误", str(error), "warn")
+            return None
+        if remote:
+            args += ["--launcher-remote-aux", json.dumps(remote, ensure_ascii=True)]
+        size = sum(row["size"] for rows in remote.values() for row in rows)
+        return args, "\n".join(details) or "按引擎默认配置", size
+
+    def _apply_auxiliary_modes(self, args, aux_args):
+        aux_args = list(aux_args)
+        if "--launcher-disable-vision" in aux_args:
+            aux_args.remove("--launcher-disable-vision")
+            args[args.index("--vision") + 1] = "no"
+        drafting = self.drafting_var.get() if hasattr(self, "drafting_var") else "auto"
+        both = bool(hasattr(self, "all_drafters_var") and self.all_drafters_var.get())
+        if "--launcher-disable-dspark" in aux_args:
+            aux_args.remove("--launcher-disable-dspark")
+            drafting, both = "off", False
+        args.extend(aux_args)
+        return args[args.index("--vision") + 1], drafting, both
+
+    def _select_community_source(self, source):
+        presets = {
+            "GSQ-RCO · 完整破限权重": "https://huggingface.co/KilltheSniper/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF",
+            "Huihui 社区权重": HUIHUI_REPO,
+        }
+        self.community_link.delete(0, "end")
+        self.community_link.insert(0, presets.get(source, ""))
+        self.community_source_note.configure(text=(
+            "从此社区仓库选择完整主模型权重。"
+            if source.startswith("Huihui") else
+            "此来源提供已修改的主 GGUF，GSQ-RCO 是量化格式。" if source.startswith("GSQ") else ""))
+
+    def select_local_import(self, pick_file):
+        if self.env.root is None:
+            self.toast("环境未就绪", "请先选择 Strata 源码目录。", "warn")
+            return
+        start = str(Path(self.effective_data_dir()) / "models") if self.effective_data_dir() else None
+        path = (filedialog.askopenfilename(title="选择 GGUF 主模型文件", initialdir=start,
+                                          filetypes=[("GGUF", "*.gguf")])
+                if pick_file else filedialog.askdirectory(title="选择包含完整 GGUF 分片的文件夹", initialdir=start))
+        if not path:
+            return
+        self.local_selection = None
+        self.local_import_btn.configure(state="disabled")
+        try:
+            info = preview_model(self.env.root, path, self.env.python())
+        except (ValueError, OSError, subprocess.SubprocessError) as error:
+            self.local_source.set(f"无法识别：{path}")
+            self._refresh_auxiliary_panels()
+            self.toast("无法识别主模型", str(error), "warn")
+            return
+        self.local_selection = (path, info)
+        self.local_source.set(f"{info['model']} · {len(info['shards'])} 个文件\n{path}")
+        self.local_import_btn.configure(state="normal")
+        self._refresh_auxiliary_panels()
+
+    def import_local_model(self, community=False):
         if self.runner.running() or self.runtime.get("updating"):
             self.toast("有任务在运行", "请等待当前任务完成后再导入。", "warn")
             return
@@ -3162,39 +3511,91 @@ class StrataLauncher(ctk.CTk):
         if self.server.running():
             self.toast("请先停止模型", "停止当前模型后再导入，避免准备文件正在被使用。", "warn")
             return
-        folder = filedialog.askdirectory(title="选择一个模型全部 GGUF 分片所在的文件夹",
-            initialdir=str(Path(self.effective_data_dir()) / 'models') if self.effective_data_dir() else None)
-        if not folder:
-            return
+        rows = None
+        direction = None
+        if community:
+            if not self.effective_data_dir():
+                self.toast("未选择模型数据目录", "请先设置 Strata-data 目录。", "warn")
+                return
+            link = self.community_link.get().strip()
+            if not link:
+                self.toast("请填写下载链接", "请选择社区来源或粘贴 Hugging Face 链接。", "warn")
+                return
+            try:
+                rows = community_manifest(link, model=self.model_var2.get())
+
+                import hashlib
+                identity = hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest()[:20]
+                folder = str(Path(self.effective_data_dir()) / "community-models" / identity)
+            except (ValueError, OSError) as error:
+                self.toast("无法读取社区模型", str(error), "warn")
+                return
+        else:
+            if not self.local_selection:
+                return
+            folder, local_info = self.local_selection
         try:
-            info = inspect_model(folder)
-            detected_vector = find_huihui_vector(folder) if info['family'] == 'coder' else None
-            if detected_vector and not self.esp_path_var.get().strip():
-                self.esp_path_var.set(str(detected_vector))
-                self.esp_var.set(True)
-            args, _, ctx, vision, port = self._build_install_args()
+            info = ({"family": self.family_var.get(), "model": self.model_var2.get(),
+                     "shards": [row["name"] for row in rows]} if community else local_info)
+            native_inkling = info.get("format") == "inkling-gguf"
+            selection = None if community else (info["family"], "SQ-10" if native_inkling else info["model"])
+            args, _, ctx, vision, port = self._build_install_args(selection)
         except (ValueError, OSError) as error:
             self.toast("无法导入", str(error), "warn")
             return
+        selected = self.choose_install_auxiliaries(info["family"], vision, local=not community)
+        if selected is None:
+            return
+        aux_args, aux_details, aux_size = selected
+        vision, drafting, all_drafters = self._apply_auxiliary_modes(args, aux_args)
+        if direction:
+            option = "--launcher-remote-aux"
+            if option in args:
+                index = args.index(option) + 1
+                manifest = json.loads(args[index])
+                manifest["projection"] = direction
+                args[index] = json.dumps(manifest, ensure_ascii=True)
+            else:
+                args += [option, json.dumps({"projection": direction}, ensure_ascii=True)]
+            aux_size += sum(row["size"] for row in direction)
+        projection = (HUIHUI_FILE if direction else
+                      (self.esp_path_var.get() or "Strata 默认向量") if self.esp_var.get() else "关闭")
+        download_info = ""
+        if rows:
+            args += ["--launcher-community", json.dumps(rows, ensure_ascii=True)]
+            cached = Path(folder)
+            need = sum(row["size"] for row in rows
+                       if not (cached / row["name"]).is_file()) + aux_size
+            try:
+                remaining = shutil.disk_usage(Path(cached.anchor)).free
+            except OSError as error:
+                self.toast("无法读取磁盘空间", str(error), "warn")
+                return
+            if remaining < need:
+                self.toast("磁盘空间不足", f"下载至少需要 {need / 1e9:.2f} GB，准备模型可能还需额外空间。", "warn")
+                return
+            download_info = f"来源：{link}\n主模型：{rows[0]['name']}\n预计待下载：{need / 1e9:.2f} GB\n"
+        elif aux_size:
+            download_info = f"手选辅助文件下载量：{aux_size / 1e9:.2f} GB\n"
         label = simpledialog.askstring("给模型起个名字", "这个名称会显示在概览页，例如 IQ3_XXS 破限：",
-            initialvalue=Path(folder).name, parent=self)
+            initialvalue=Path(rows[0]["name"]).stem if rows else Path(folder).name, parent=self)
         if label is None:
             return
         label = label.strip()
         if not label or len(label) > 80:
             self.toast("名称有误", "请输入 1 至 80 个字的模型名称。", "warn")
             return
-        if not messagebox.askyesno("确认导入本地模型",
+        if not messagebox.askyesno("确认下载社区模型" if community else "确认导入本地模型",
             f"名称：{label}\n规格：{info['model']}（{len(info['shards'])} 个分片）\n"
-            f"文件夹：{folder}\n上下文：{ctx_label(ctx)}\n\n"
-            f"拒答方向投影：{(self.esp_path_var.get() or 'Strata 默认向量') if self.esp_var.get() else '关闭'}\n\n"
-            "直接使用已有文件，建立独立准备目录与启动配置。首次可能联网补齐引擎和辅助资源。\n"
+            f"主模型路径：{folder}\n上下文：{ctx_label(ctx)}\n读图：{vision}\n\n"
+            f"{download_info}{aux_details}\n\n"
+            "建立独立准备目录与启动配置。首次可能联网补齐引擎和辅助资源。\n"
             "请保持窗口开启，进度会显示在安装日志中。\n\n开始准备吗？"):
             return
-        self._force_fresh_wizard()
         self.save_all_settings("本地导入前自动保存")
         self.install_log.clear()
-        self.install_log.append("=== 正在准备本地模型（不重新下载模型分片）===")
+        self.install_log.append("=== 正在下载社区模型并检查兼容性 ===" if community
+                                else "=== 正在准备本地模型 ===")
         self.install_btn.configure(state="disabled")
         self.local_import_btn.configure(state="disabled")
         self.cancel_btn.configure(state="normal")
@@ -3203,8 +3604,17 @@ class StrataLauncher(ctk.CTk):
             source = Path(getattr(sys, '_MEIPASS', Path(__file__).parent)) / 'strata_local_import.py'
             helper = self.env.root / '.launcher-local-import.py'
             helper.write_text(source.read_text(encoding='utf-8'), encoding='utf-8')
+            install_helper = source.parent / 'strata_install.py'
+            if (self.env.root / 'strata_install.py').resolve() != install_helper.resolve():
+                shutil.copy2(install_helper, self.env.root / 'strata_install.py')
+            for auxiliary in ('strata_orca_import.py', 'strata_update.py', 'strata_versions.py', 'strata_launch_support.py', 'strata_download.py', 'strata_inkling_vision.py', 'strata_native_inkling.py'):
+                if (source.parent / auxiliary).resolve() != (self.env.root / auxiliary).resolve():
+                    shutil.copy2(source.parent / auxiliary, self.env.root / auxiliary)
+            shutil.copytree(source.parent / 'strata_native_inkling', self.env.root / 'strata_native_inkling', dirs_exist_ok=True)
             cmd = [py, str(helper), str(self.env.root), folder,
-                   self.data_entry.get().strip(), label, *args]
+                   self.effective_data_dir(), label, *args, '--launcher-drafting', drafting]
+            if all_drafters:
+                cmd.append('--launcher-all-drafters')
         except Exception as error:
             self._on_install_done(-1, str(error))
             return
@@ -3217,6 +3627,8 @@ class StrataLauncher(ctk.CTk):
                  **({'HF_ENDPOINT': HF_MIRROR} if self.hf_var.get() else {})})
 
     def run_install(self):
+        if self.community_link.get().strip():
+            return self.import_local_model(community=True)
         if self.runner.running():
             self.toast("正在安装", "已有安装任务在运行。", "warn")
             return
@@ -3229,7 +3641,14 @@ class StrataLauncher(ctk.CTk):
             self.toast("参数有误", str(e), "warn")
             return
 
-        need = (md.get("download_gb") or 0) + (md.get('prepare_gb') or 0)
+        family = args[args.index("--family") + 1]
+        selected = self.choose_install_auxiliaries(family, vision)
+        if selected is None:
+            return
+        aux_args, aux_details, aux_size = selected
+        vision, drafting, all_drafters = self._apply_auxiliary_modes(args, aux_args)
+
+        need = (md.get("download_gb") or 0) + (md.get('prepare_gb') or 0) + aux_size / 1e9
         target = Path(self.data_entry.get().strip())
         free = dir_free_gb(target.anchor if not target.exists() else target)
         if free and free < need:
@@ -3241,7 +3660,7 @@ class StrataLauncher(ctk.CTk):
                 f"下载体积：约 {need:.0f} GB（可断点续传）\n"
                 f"数据目录：{target}\n"
                 f"上下文：{ctx}\n"
-                f"读图：{vision}\n\n"
+                f"读图：{vision}\n{aux_details}\n\n"
                 f"下载与准备时间较长（视网速可能需要数小时），期间请保持本窗口开启。\n\n确定开始吗？")
         if not messagebox.askyesno("确认安装", warn):
             return
@@ -3260,7 +3679,10 @@ class StrataLauncher(ctk.CTk):
             self.cancel_btn.configure(state="disabled")
             self.toast("运行环境创建失败", str(e), "error")
             return
-        cmd = [py, str(self.env.root / "setup.py")] + args
+        helper = Path(getattr(sys, '_MEIPASS', Path(__file__).parent)) / 'strata_install.py'
+        cmd = [py, str(helper), str(self.env.root), '--launcher-drafting', drafting] + args
+        if all_drafters:
+            cmd.append('--launcher-all-drafters')
         self.install_log.append("$ " + " ".join(cmd))
         env = {"HF_ENDPOINT": HF_MIRROR, "PYTHONUNBUFFERED": "1"} if self.hf_var.get() else {"PYTHONUNBUFFERED": "1"}
         if self.hf_var.get():
@@ -3282,7 +3704,7 @@ class StrataLauncher(ctk.CTk):
     def _on_install_done(self, rc, err):
         local_label = getattr(self, '_local_import_label', None)
         self._local_import_label = None
-        self.local_import_btn.configure(state="normal")
+        self.local_import_btn.configure(state="normal" if getattr(self, "local_selection", None) else "disabled")
         self.install_btn.configure(state="normal")
         self.cancel_btn.configure(state="disabled")
         self.runtime["installing"] = False
@@ -3646,7 +4068,7 @@ class StrataLauncher(ctk.CTk):
         if ent:
             md = self.env.models_for(ent.get('family')).get(ent.get('model'), {})
             if md.get('contexts'):
-                contexts = md['contexts']
+                contexts = sorted(set(md['contexts']) | set(FALLBACK_CONTEXTS))
                 vals = [ctx_label(c) for c in contexts]
                 self.ctx_quick_menu.configure(values=vals)
         self._quick_ent = ent
@@ -3936,7 +4358,7 @@ class StrataLauncher(ctk.CTk):
         ctk.CTkButton(urow, text="检查最新版本", width=120, height=32, corner_radius=8, fg_color=COLORS["chip"],
                       text_color=COLORS["text"], hover_color="#dde5f7", font=ctk.CTkFont(family=FONT, size=12),
                       command=self.check_update).pack(side="left")
-        ctk.CTkButton(urow, text="安装所选版本", width=140, height=32, corner_radius=8,
+        ctk.CTkButton(urow, text="一键更新最新版", width=140, height=32, corner_radius=8,
                       fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"],
                       font=ctk.CTkFont(family=FONT, size=12),
                       command=self.do_update).pack(side="left", padx=8)
@@ -3945,7 +4367,7 @@ class StrataLauncher(ctk.CTk):
                       command=self.open_release_page).pack(side="left")
 
         self.auto_update_var = ctk.BooleanVar(value=bool(self.cfg.get("auto_update")))
-        ctk.CTkCheckBox(uinner, text="启动时检查更新（固定版本时仅提示；未固定时独立安装新版）",
+        ctk.CTkCheckBox(uinner, text="启动时检查更新并提示",
                         variable=self.auto_update_var, text_color=COLORS["text"],
                         font=ctk.CTkFont(family=FONT, size=12), checkbox_width=20, checkbox_height=20,
                         command=lambda: self.cfg.set("auto_update", self.auto_update_var.get())).pack(anchor="w",
@@ -3967,21 +4389,13 @@ class StrataLauncher(ctk.CTk):
         self.version_list_status.pack(anchor='w')
         row = ctk.CTkFrame(versions, fg_color="transparent")
         row.pack(fill="x")
-        for index, (title, action) in enumerate([('刷新版本', self.refresh_versions), ('检查兼容性', self.check_version),
-                              ('安装所选版本', self.install_version), ('切换已安装版本', self.switch_version),
-                              ('回退', self.rollback_version), ('清理所选版本', self.clean_version)]):
-            ctk.CTkButton(row, text=title, width=140, command=action).grid(row=index // 3, column=index % 3,
-                                                                      padx=(0, 6), pady=4, sticky='w')
-        self.installed_version_choice = ctk.StringVar(value='请选择已安装环境')
-        self.installed_version_menu = ctk.CTkComboBox(versions, variable=self.installed_version_choice,
-                                                     values=['请选择已安装环境'], width=440)
-        self.installed_version_menu.pack(anchor='w', pady=6)
-        ctk.CTkButton(versions, text='使用列表中的环境', command=self.use_installed_version).pack(anchor='w')
-        self.version_pin = ctk.BooleanVar(value=bool(self.cfg.get('version_pinned', True)))
-        ctk.CTkCheckBox(versions, text="固定所选版本（自动更新仅提示）", variable=self.version_pin,
-                        command=lambda: self.cfg.set('version_pinned', self.version_pin.get())).pack(anchor="w", pady=8)
-        ctk.CTkLabel(versions, text="安装使用独立目录；切换后下次启动生效。历史版缺少签名源时会停止安装。",
-                    text_color=COLORS['text_dim']).pack(anchor="w")
+        for title, action in (
+            ('更新最新版', self.do_update), ('下载并切换', self.install_version),
+            ('刷新版本', self.refresh_versions), ('重试清理旧版', self.clean_version),
+        ):
+            ctk.CTkButton(row, text=title, width=140, command=action).pack(side='left', padx=4)
+        self.active_version_label = ctk.CTkLabel(versions, text=APP_NAME)
+        self.active_version_label.pack(anchor='w')
 
         card = make_card(page, "维护工具")
         card.pack(fill="x", pady=(0, 12))
@@ -3989,7 +4403,6 @@ class StrataLauncher(ctk.CTk):
         inner.pack(fill="x", padx=16, pady=(0, 12))
 
         tools = [
-            ("更新引擎与依赖", "独立安装上方所选发布版本的配套引擎与依赖，完成后手动切换。", self.tool_update),
             ("校准性能", "为本机调优引擎参数（约 5-10 分钟），完成后按默认启动。", self.tool_calibrate),
             ("重新体检", "再次运行 setup.py --check 输出体检结论。", self.tool_check),
             ("打开 Strata 目录", "打开引擎源码目录（配置、日志所在处）。", lambda: self._open_path(self.env.root)),
@@ -4046,29 +4459,11 @@ class StrataLauncher(ctk.CTk):
         try:
             store = self._version_store()
             state = store.state()
-            mapping = {}
-            for path, entry in state['environments'].items():
-                status = '当前' if path == state.get('current') else '可回退' if path == state.get('previous') else '已安装'
-                if not entry.get('verified') and not entry.get('original'):
-                    status = '安装未完成'
-                label = f"{entry['release']} / 引擎 {entry['engine']} / {status} / {Path(path).name}"
-                mapping[label] = path
-            self._installed_version_map = mapping
-            self.installed_version_menu.configure(values=list(mapping) or ['暂无已安装环境'])
-            selected = next((label for label, path in mapping.items() if path == state.get('current')), None)
-            if selected:
-                self.installed_version_choice.set(selected)
+            entry = state['environments'].get(state.get('current'), {})
+            self.active_version_label.configure(
+                text=f"{APP_NAME} · Strata {entry.get('release', '未安装')} / 引擎 {entry.get('engine', '未安装')}")
         except Exception as exc:
-            self._version_log(f'读取已安装环境失败：{exc}')
-
-    def use_installed_version(self):
-        try:
-            path = self._installed_version_map.get(self.installed_version_choice.get())
-            if not path:
-                raise RuntimeError('请从已安装列表选择环境。')
-            self._activate_version(path)
-        except Exception as exc:
-            self.toast('切换失败', str(exc), 'warn')
+            self._version_log(f'读取当前环境失败：{exc}')
 
     def _version_store(self):
         store = VersionStore(APP_DIR)
@@ -4129,58 +4524,26 @@ class StrataLauncher(ctk.CTk):
         value = self.version_choice.get()
         return normalize_release(getattr(self, '_release_labels', {}).get(value, value))
 
-    def check_version(self):
-        try:
-            version = self._chosen_release()
-        except ValueError as exc:
-            self.toast('版本无效', str(exc), 'warn')
-            return
-        def worker():
-            try:
-                with urllib.request.urlopen(pinned_feed(version), timeout=20) as response:
-                    data = response.read()
-                if not isinstance(json.loads(data), dict):
-                    raise RuntimeError('官方组件源格式无效')
-                self._version_log(f'v{version}：官方组件源可访问，继续执行官方签名与硬件预检。')
-                root = self.env.root or self.env.find_root()
-                if not root or not (Path(root) / 'strata.py').is_file():
-                    self._version_log('当前环境没有官方组件检查接口；安装所选源码后继续预检。')
-                    return
-                python = self.env.python()
-                if not python:
-                    raise RuntimeError('缺少 Python 运行环境')
-                with tempfile.TemporaryDirectory(prefix='strata-version-check-') as work:
-                    result = subprocess.run([python, str(Path(root) / 'strata.py'), 'update', '--check',
-                                             '--no-control', '--feed', pinned_feed(version),
-                                             '--components-dir', work, '--output', 'json'],
-                                            cwd=root, capture_output=True, text=True, encoding='utf-8',
-                                            errors='replace', timeout=120,
-                                            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-                self._version_log(result.stdout or result.stderr)
-                if result.returncode:
-                    raise RuntimeError(f'官方兼容性检查未通过（{result.returncode}）')
-                self._version_log('官方组件预检通过；具体模型加载与真实推理仍需启动后验证。')
-            except Exception as exc:
-                self._version_log(f'v{version} 暂不可安装：未取得对应官方组件源：{exc}')
-        threading.Thread(target=worker, daemon=True).start()
-
     def install_version(self):
-        if self.runtime.get('updating') or self.server.running() or getattr(self, '_starting', False):
-            self.toast('暂不能安装', '请等待维护任务结束并停止模型服务。', 'warn')
-            return
         try:
             version = self._chosen_release()
         except ValueError as exc:
             self.toast('版本无效', str(exc), 'warn')
             return
-        self.cfg.set('preferred_release', version)
-        self.runtime['updating'] = True
-        threading.Thread(target=self._install_version_worker, args=(version,), daemon=True).start()
+        self.do_update(version)
 
-    def _install_version_worker(self, version):
+    def _install_version_worker(self, version, activate=False):
+        target = None
         try:
+            if activate and version is None:
+                version, _url, _published = remote_latest_release()
+                version = normalize_release(version)
+                self._version_log(f"一键更新目标：v{version}")
             store = self._version_store()
             source = self.env.ensure_root(self._version_log)
+            if installed_release(source) == version:
+                self._version_log(f'当前已启用 v{version}。')
+                return
             # Resolve the release-specific feed before downloading or preparing an environment.
             with urllib.request.urlopen(pinned_feed(version), timeout=20) as response:
                 json.load(response)
@@ -4191,6 +4554,8 @@ class StrataLauncher(ctk.CTk):
                                 archive, self._version_log)
                 extracted = extract_source(archive, Path(work) / 'source')
                 shutil.copytree(extracted, target, dirs_exist_ok=True)
+            if (target / 'terminal/setup.py').is_file():
+                target = target / 'terminal'
             if not (target / 'strata_cli/update_cmd.py').is_file():
                 raise RuntimeError('此历史版本缺少签名组件更新接口，未切换环境。')
             copy_configs(source, target)
@@ -4198,11 +4563,11 @@ class StrataLauncher(ctk.CTk):
             env = StrataEnv()
             env.root = target
             py = env.ensure_venv(self._version_log)
-            helper = Path(getattr(sys, '_MEIPASS', Path(__file__).parent)) / 'strata_update.py'
+            helper = UPDATE_HELPERS / 'strata_update.py'
             process_env = dict(os.environ, STRATA_LAUNCHER_RELEASE=version,
                                PYTHONIOENCODING='utf-8', PYTHONUTF8='1')
-            self._version_log(f'安装 v{version}，配套引擎 {source_engine_version(target)}：{target}')
-            with subprocess.Popen([py, '-u', str(helper), str(target)], cwd=target, env=process_env,
+            self._version_log(f'安装 v{version}，以官方签名清单选择引擎：{target}')
+            with subprocess.Popen([py, '-E', '-X', 'utf8', '-u', str(helper), str(target)], cwd=target, env=process_env,
                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                   encoding='utf-8', errors='replace',
                                   creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0) as proc:
@@ -4210,7 +4575,7 @@ class StrataLauncher(ctk.CTk):
                     self._version_log(line.rstrip())
                 if proc.wait():
                     raise RuntimeError('目标环境安装失败，当前环境保持可用。详见工具输出。')
-            check_exact_engines(target)
+            check_exact_engines(target, version)
             validate_config_flags(target)
             service_check = subprocess.run([py, str(target / 'serve/server.py'), '--help'], cwd=target,
                                            env=process_env, capture_output=True, timeout=60,
@@ -4219,14 +4584,94 @@ class StrataLauncher(ctk.CTk):
                 raise RuntimeError('此版本服务接口或依赖不完整，未开放切换：' + service_check.stderr.decode('utf-8', 'replace')[-1200:])
             record_release(target, version)
             store.register(target, version, verified=True)
-            self._version_log('安装与文件校验完成；可点击“切换已安装版本”。真实模型推理尚未验证。')
+            self._version_log('安装与文件校验完成，准备自动启用。' if activate else
+                              '安装与文件校验完成；可点击“切换已安装版本”。真实模型推理尚未验证。')
         except Exception as exc:
+            target = None
             self._version_log(f'[安装失败] {exc}')
         finally:
-            self.runtime['updating'] = False
-            self.ui(self._refresh_version_environments)
+            if activate:
+                self.ui(self._finish_version_install, target, activate)
+            else:
+                self.runtime['updating'] = False
+                self.ui(self._refresh_version_environments)
 
-    def _activate_version(self, path):
+    def _finish_version_install(self, target, activate):
+        resume = getattr(self, '_update_resume', None)
+        try:
+            if activate and target is not None:
+                if resume:
+                    self._version_log('新环境校验完成，停止模型并切换；启动失败会自动恢复旧环境。')
+                    self.server.stop()
+                self.runtime['updating'] = False
+                self._activate_version(target, confirm_differences=False)
+                if resume:
+                    self.runtime['updating'] = True
+                    threading.Thread(target=self._resume_after_update, args=(target, resume), daemon=True).start()
+                    return
+                self._version_log('目标版本已启用；尚未运行模型推理验证。')
+                self.clean_version()
+        except Exception as exc:
+            self._version_log(f'[启用失败] {exc}')
+            if resume:
+                self.runtime['updating'] = False
+                self._activate_version(resume['root'], confirm_differences=False)
+                self.runtime['updating'] = True
+                threading.Thread(target=self._resume_after_update,
+                                 args=(resume['root'], resume, False), daemon=True).start()
+                return
+        self.runtime['updating'] = False
+        self._update_resume = None
+        self._refresh_version_environments()
+
+    def _resume_after_update(self, target, resume, rollback=True):
+        try:
+            config = Path(target) / resume['config'].name if rollback else Path(resume['config'])
+            self.server.start(self.env, config, open_browser=False,
+                              vision_enabled=resume['vision'], optimization=resume['optimization'],
+                              chat_template=resume['chat_template'], data_dir=resume['data_dir'])
+            threading.Thread(target=self._drain_server_log, args=(self.server.log_queue,), daemon=True).start()
+            deadline = time.monotonic() + 300
+            while time.monotonic() < deadline:
+                if not self.server.running():
+                    raise RuntimeError('模型服务在准备期间退出')
+                status, body = http_probe(self.server.local_url() + '/health')
+                if strata_health_ready(status, body, llama_backend=self.server.active_config.get("engine") == "llama.cpp"):
+                    self._version_log('模型服务健康检查通过，更新后已恢复运行。')
+                    self.ui(self._finish_update_resume, rollback)
+                    return
+                time.sleep(1)
+            raise RuntimeError('模型服务在 300 秒内未就绪')
+        except Exception as exc:
+            self.server.stop()
+            self._version_log(f'[恢复启动失败] {exc}')
+            if rollback:
+                self.ui(self._rollback_failed_update, resume)
+            else:
+                self._version_log('旧环境已恢复，但模型未能重新启动，请查看启动日志。')
+                self.ui(self._finish_update_resume)
+
+    def _rollback_failed_update(self, resume):
+        self.runtime['updating'] = False
+        try:
+            self._activate_version(resume['root'], confirm_differences=False)
+        except Exception as exc:
+            self._version_log(f'[回退失败] {exc}')
+            self._finish_update_resume()
+            return
+        self.runtime['updating'] = True
+        threading.Thread(target=self._resume_after_update,
+                         args=(resume['root'], resume, False), daemon=True).start()
+
+    def _finish_update_resume(self, committed=False):
+        self.runtime['updating'] = False
+        if committed:
+            self.clean_version()
+        self.runtime['running'] = self.server.running()
+        self._update_resume = None
+        self._refresh_version_environments()
+
+    def _activate_version(self, path, confirm_differences=True):
         if self.runtime.get('updating') or self.server.running() or getattr(self, '_starting', False):
             raise RuntimeError('请先停止服务并等待维护任务完成。')
         store = self._version_store()
@@ -4252,13 +4697,14 @@ class StrataLauncher(ctk.CTk):
                 def flag_value(config, flag):
                     args = config.get('args', [])
                     return args[args.index(flag) + 1] if flag in args and args.index(flag) + 1 < len(args) else None
-                for flag in ('--max-context', '--kv', '--kv-resident', '--draft', '--mtp'):
+                for flag in ('--max-context', '--ctx-size', '--kv', '--cache-type-k', '--cache-type-v',
+                             '--kv-resident', '--draft', '--mtp', '--spec-type'):
                     before, after = flag_value(old, flag), flag_value(new, flag)
                     if before != after:
                         differences.append(f'{old_path.name}：{flag} {before} → {after}')
             if differences:
                 self._version_log('切换配置差异：\n' + '\n'.join(differences))
-                if not messagebox.askyesno('确认版本配置差异', '\n'.join(differences[:16]) + '\n\n使用目标环境保存的独立配置？'):
+                if confirm_differences and not messagebox.askyesno('确认版本配置差异', '\n'.join(differences[:16]) + '\n\n使用目标环境保存的独立配置？'):
                     return
         path = store.activate(path)
         self.cfg.set('strata_dir', path)
@@ -4270,43 +4716,14 @@ class StrataLauncher(ctk.CTk):
         self._refresh_version_environments()
         self._version_log(f'已选择环境：{path}；下次启动使用此环境。')
 
-    def switch_version(self):
-        try:
-            version = self._chosen_release()
-            candidates = [(path, entry) for path, entry in self._version_store().state()['environments'].items()
-                          if entry.get('release') == version and entry.get('verified')]
-            if not candidates:
-                raise RuntimeError('所选版本尚未完成安装，请先安装。')
-            path, _ = max(candidates, key=lambda item: item[1]['installed_at'])
-            self._activate_version(path)
-        except Exception as exc:
-            self.toast('切换失败', str(exc), 'warn')
-
-    def rollback_version(self):
-        try:
-            path = self._version_store().state().get('previous')
-            if not path:
-                raise RuntimeError('还没有可回退环境。')
-            self._activate_version(path)
-        except Exception as exc:
-            self.toast('回退失败', str(exc), 'warn')
-
     def clean_version(self):
+        if self.runtime.get('updating'):
+            return
         try:
-            if self.runtime.get('updating') or self.server.running():
-                raise RuntimeError('请先停止服务并等待维护任务结束。')
-            version = self._chosen_release()
-            store = self._version_store()
-            paths = [path for path, entry in store.state()['environments'].items() if entry.get('release') == version]
-            if not paths:
-                raise RuntimeError('没有找到此版本的已登记环境。')
-            if messagebox.askyesno('清理版本', '删除以下独立环境（当前和回退环境受保护）：\n' + '\n'.join(paths)):
-                for path in paths:
-                    store.remove(path)
-                    self._version_log(f'已清理环境：{path}')
-                self._refresh_version_environments()
+            for message in self._version_store().prune():
+                self._version_log(message)
         except Exception as exc:
-            self.toast('清理未完成', str(exc), 'warn')
+            self._version_log(f'旧版清理待完成：{exc}')
 
     def _refresh_cleanup_models(self):
         if not hasattr(self, 'cleanup_model_menu'):
@@ -4514,7 +4931,7 @@ class StrataLauncher(ctk.CTk):
                         lambda line: self.ui(self.tools_log.append, line), _finish)
 
     def tool_update(self):
-        self.install_version()
+        self.do_update()
 
     def tool_calibrate(self):
         if not messagebox.askyesno("校准性能", "校准约需 5-10 分钟，期间会占用显卡。\n确定开始吗？"):
@@ -4640,27 +5057,11 @@ class StrataLauncher(ctk.CTk):
             self.up_status.configure(text=f"联网检查失败：{err}（“最新版本”为已知版本，可点「打开发布页」确认）",
                                      text_color=COLORS["warning"])
         elif not local:
-            self.up_status.configure(text="无法读取本地版本号，可直接点「立即更新 Strata」重下官方源码。",
+            self.up_status.configure(text="无法读取本地版本号，可点击「一键更新最新版」安装并启用官方正式版。",
                                      text_color=COLORS["warning"])
         else:
             self.up_status.configure(text="", text_color=COLORS["text_dim"])
-        if auto and self.cfg.get("auto_update") and not self.cfg.get('version_pinned', True):
-            # 仅以安装目录中经过校验的发布记录判断，忽略旧版误写的成功缓存。
-            if err:
-                self.up_status.configure(text=f"自动更新已跳过：联网检查失败（{err}）。",
-                                         text_color=COLORS["warning"])
-                self.tools_log.append("[更新] 自动更新跳过：联网检查失败。")
-            elif not local:
-                self.tools_log.append("[更新] 自动更新跳过：无法读取本地版本号，可手动点击「立即更新」。")
-            elif remote and version_tuple(remote) > version_tuple(local):
-                self.up_status.configure(text="自动更新已开启，检测到新版本，正在更新…",
-                                         text_color=COLORS["warning"])
-                self.tools_log.append(f"[更新] 检测到新版本 v{remote}（当前 v{local}），开始自动更新。")
-                self._start_update(auto=True)
-            else:
-                self.up_status.configure(text="已是最新版本，自动更新已跳过。",
-                                         text_color=COLORS["text_dim"])
-                self.tools_log.append(f"[更新] 已是最新版本（v{local or remote}），自动更新跳过。")
+        # Startup checking only reports availability. Explicit update owns installation and switching.
 
     def open_release_page(self):
         url = self._remote_url or GITHUB_RELEASES_PAGE
@@ -4670,17 +5071,24 @@ class StrataLauncher(ctk.CTk):
             import webbrowser
             webbrowser.open(url)
 
-    def do_update(self):
-        self.install_version()
+    def do_update(self, version=None):
+        if self.runtime.get('updating') or self.runner.running() or getattr(self, '_starting', False):
+            self.toast('暂不能更新', '请等待当前安装、维护或模型启动任务完成。', 'warn')
+            return
+        self._update_resume = None
+        if self.server.running():
+            config = Path(self.server.cfg_path)
+            self._update_resume = dict(root=Path(self.env.root), config=config,
+                vision=bool(self.cfg.get('runtime_vision_enabled')),
+                optimization=self._model_optimization(config),
+                chat_template=self._model_chat_template(config), data_dir=self.effective_data_dir())
+        self.runtime['updating'] = True
+        self._version_log('正在检查最新正式版，下载、校验并自动启用；运行中模型将在切换时停止并恢复，接管成功后清理旧环境。')
+        threading.Thread(target=self._install_version_worker, args=(version, True), daemon=True).start()
 
     def _start_update(self, auto=False):
-        if auto:
-            if any(entry.get('release') == self._remote_version and entry.get('verified')
-                   for entry in self._version_store().state()['environments'].values()):
-                self._version_log('最新发布环境已安装，可从已安装列表切换。')
-                return
-            self.version_choice.set(self._remote_version)
-        self.install_version()
+        if not auto:
+            self.do_update()
 
     def _update_worker(self, auto):
         def log(s):
@@ -4757,71 +5165,162 @@ class StrataLauncher(ctk.CTk):
             self.up_status.configure(text=f"更新未完成（退出码 {rc}），详见工具输出。", text_color=COLORS["warning"])
 
     # =================================================================== 帮助页
+    def _poll_launcher_release(self):
+        self.check_launcher_update()
+        self.after(30 * 60 * 1000, self._poll_launcher_release)
+
+    def check_launcher_update(self, manual=False):
+        if getattr(self, "_release_busy", False):
+            return
+        self._release_busy = True
+        if manual:
+            self.release_status.configure(text="正在检查 GitHub 正式发布…")
+
+        def worker():
+            try:
+                release = check_launcher_release(APP_VERSION)
+            except (OSError, ValueError) as error:
+                self.ui(self._show_launcher_release, None, str(error))
+            else:
+                self.ui(self._show_launcher_release, release, None)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_launcher_release(self, release, error):
+        self._release_busy = False
+        if error:
+            self.release_status.configure(text=f"检查失败：{error}")
+            return
+        previous = getattr(self, "_launcher_release", None)
+        self._launcher_release = release
+        self.release_install_btn.configure(state="normal" if release else "disabled")
+        self.nav_buttons["help"].configure(text="软件更新说明" if not release else f"有更新 · V{release.version}")
+        if release:
+            self.release_status.configure(text=f"发现 V{release.version} · {release.size / 1024**2:.1f} MiB")
+            self.release_notes.configure(text=release.notes or "本次发布未填写更新说明。")
+            if previous is None or previous.version != release.version:
+                self.toast("发现启动器更新", f"GitHub 已发布 V{release.version}，可在软件更新说明页安装。")
+        else:
+            self.release_status.configure(text=f"当前版本 V{APP_VERSION}，暂无新版本")
+            self.release_notes.configure(text="")
+
+    def install_launcher_update(self):
+        release = getattr(self, "_launcher_release", None)
+        if not release or getattr(self, "_release_busy", False):
+            return
+        if not getattr(sys, "frozen", False):
+            self.toast("当前运行的是源码", "请使用 GitHub 发布的 Windows EXE。", "warn")
+            return
+        if self.server.running() or self.runner.running() or self.runtime.get("updating"):
+            self.toast("正在运行任务", "请先停止模型服务或等待安装及更新完成。", "warn")
+            return
+        self._release_busy = True
+        self.release_install_btn.configure(state="disabled")
+        self.release_status.configure(text=f"正在下载和校验 V{release.version}…")
+
+        def worker():
+            try:
+                path = stage_launcher(release, APP_DIR)
+            except (OSError, ValueError) as error:
+                self.ui(self._finish_launcher_update, release, None, str(error))
+            else:
+                self.ui(self._finish_launcher_update, release, path, None)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_launcher_update(self, release, path, error):
+        self._release_busy = False
+        self.release_install_btn.configure(state="normal")
+        if error:
+            self.release_status.configure(text=f"更新失败：{error}")
+            return
+        if self.server.running() or self.runner.running() or self.runtime.get("updating"):
+            self.release_status.configure(text=f"V{release.version} 已校验，任务结束后点击安装即可启动。")
+            return
+        try:
+            self._save_exit_settings()
+            env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")
+            subprocess.Popen([str(path)], cwd=APP_DIR, env=env)
+        except OSError as error:
+            self.release_status.configure(text=f"新版已保存，启动失败：{error}")
+            return
+        self._closing = True
+        self.destroy()
+
     def _page_help(self):
         page = ctk.CTkScrollableFrame(self.content, fg_color="transparent")
         page.grid_columnconfigure(0, weight=1)
-        card = make_card(page, "使用帮助")
+        card = make_card(page, "软件更新说明")
         card.pack(fill="x", pady=(0, 12))
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.pack(fill="x", padx=16, pady=(0, 10))
+        ctk.CTkButton(row, text="检查启动器更新", command=lambda: self.check_launcher_update(manual=True)).pack(side="left")
+        self.release_install_btn = ctk.CTkButton(row, text="安装并启动新版", state="disabled",
+                                                 command=self.install_launcher_update)
+        self.release_install_btn.pack(side="left", padx=8)
+        ctk.CTkButton(row, text="GitHub 发布页", command=lambda: __import__("webbrowser").open(LAUNCHER_RELEASES)).pack(side="left")
+        self.release_status = ctk.CTkLabel(card, text=f"当前版本 V{APP_VERSION}", wraplength=760, justify="left")
+        self.release_status.pack(anchor="w", padx=16)
+        self.release_notes = ctk.CTkLabel(card, text="", wraplength=760, justify="left")
+        self.release_notes.pack(anchor="w", padx=16, pady=(0, 8))
         text = (
-            "一、两种模式\n"
-            "  · 已有模型：启动器检测到已安装的模型配置时自动进入。此模式只做启动、停止、监控、改配置与维护。\n"
-            "  · 全新安装：没有检测到模型时进入。按向导依次选择家族、规格、上下文、读图与网络，然后开始下载。\n"
-            "  顶部「切换模式」按钮可随时手动切换。\n\n"
-            "二、关于目录（全部由你决定，启动器不写死路径）\n"
-            "  · Strata 目录：留空时自动定位（内置或已释放的源码）；也可用「浏览…」手动选择，\n"
-            "    或用「扫描硬盘」自动查找含 setup.py 的源码目录。\n"
-            "  · 模型数据目录：用「浏览…」手动选择，或用「扫描硬盘」查找已有的 models/packs/mtp 目录；\n"
-            "    安装模型时必须选定，启动器不会替你指定路径（模型约 59-112 GB）。\n\n"
-            "三、版本更新\n"
-            "  在「维护工具」刷新正式版本列表，或输入发布标签（例如 0.2.10），检查后安装。\n"
-            "  每个发布使用独立的源码、依赖和配套引擎；完成后从已安装列表切换，下次启动生效。\n"
-            "  默认固定版本；可离线切换、回退。当前和回退环境受到清理保护，模型文件继续共享。\n"
-            "  历史版本没有官方签名组件源、硬件不兼容或参数不支持时，会提示原因。\n\n"
-            "四、首次启动为什么很慢\n"
-            "  首次加载会把 34-55 GB 的模型读入内存，电脑可能卡顿 1-3 分钟，这是正常现象，请不要关闭窗口。\n\n"
-            "五、局域网访问（本地启动无需 API 密钥）\n"
-            "  · 本地访问（127.0.0.1，默认）：不需要 API 密钥，最安全。\n"
-            "  · 局域网访问：Strata 官方要求监听地址不是 127.0.0.1 时必须带 API 密钥；\n"
-            "    本启动器会自动生成密钥（无需手动输入），并提供「防火墙放行该端口」按钮。\n"
-            "  修改后需要重启模型服务才会生效。\n\n"
-            "六、下载中断\n"
-            "  Hugging Face 下载支持断点续传。中断后重新点击「开始下载并安装」即可继续，已完成步骤会被跳过。\n"
-            "  网络较慢时可勾选「使用 hf-mirror.com 镜像加速下载」。\n\n"
-            "七、接口\n"
-            "  服务启动后提供 OpenAI 兼容接口：http://127.0.0.1:端口/v1/chat/completions\n"
-            "  健康检查：/health　状态：/status　指标：/metrics　卸载模型：POST /unload\n"
-        )
+            "启动器 V3.7.17 · 速度优先预设\n"
+            "  · Qwen 使用 2 GiB 内存预留、自动分块和默认专家交换；清除旧激进参数。\n"
+            "  · Inkling 为 KV 保留工作区，避免全部缓存落到系统内存。\n"
+            "  · 增加关闭思考选项；速度优先启动后验证至少 500 MiB 空闲显存。\n\n"
+            "启动器 V3.7.16 · Inkling KV 与运行工作区修复\n"
+            "  · 安装、导入和运行统一传递 KV 精度，旧配置缺省使用 INT8。\n"
+            "  · Inkling 工作区预留至少 1536 MiB，为生成与读图保留运行余量。\n"
+            "  · Q4 KV 在 Inkling 上明确提示采用支持的 INT8，重新扫描已安装模型。\n\n"
+            "启动器 V3.7.15 · 统一模型安装与 Strata 原生运行\n"
+            "  · 社区来源与官方下载共用安装按钮，移除重复 IQ4 和社区下载按钮。\n"
+            "  · Inkling GGUF 使用 Strata，支持原 DSpark 与 mmproj 视觉分片转换，迁移旧配置。\n"
+            "  · 上下文增加 640K、768K、896K 和 1M，保留请求值并交由引擎检查。\n"
+            "  · 移除拒答方向投影与高级选项开关，标注名称中声明的无限制模型。\n\n"
+            "启动器 V3.7.14 · 修复 llama.cpp 模型的 WebUI 监控仪表盘\n"
+            "  · llama.cpp 模型直接使用其配置的运行版，Strata 继续校验自己的签名引擎。\n\n"
+            "启动器 V3.7.11 · Inkling DSpark 加速兼容\n"
+            "  · 对已验证的 Inkling GGUF 与旧版 DSpark 文件组合，调用配套后端和已转换权重。\n\n"
+            "启动器 V3.7.10 · Inkling GGUF 后端兼容\n"
+            "  · Strata 遇到已知的 Inkling 张量布局差异时，使用 llama.cpp。\n\n"
+            "启动器 V3.7.9 · 模型安装页与辅助模型设置\n"
+            "  · 下载、本地导入、已安装模型分别显示，辅助模型可在页面内设置。\n"
+            "  · 增加 GSQ-RCO 完整破限权重和 Huihui 方向向量入口。\n\n"
+            "启动器 V3.7.8 · 修复 Inkling 2 Mini GGUF 本地导入\n"
+            "  · 识别 GGUF 内部架构，由 Inkling 引擎检查权重和配套文件。\n"
+            "  · GitHub 限流时改用公开发布页检查。\n\n"
+            "启动器 V3.7.7 · GitHub 自动检查更新\n"
+            "  · 启动后和运行期间检查正式发布，发现新版后提示安装。\n"
+            "  · 下载通过 SHA-256 校验后启动新版，旧版本保留在原目录。\n\n"
+            "启动器 V3.7.6 · 模型安装\n"
+            "  · 官方下载与本地导入共用辅助模型选择，可浏览本地文件或输入 Hugging Face 文件链接。\n"
+            "  · 新增社区 GGUF 下载入口，按固定提交及文件哈希下载完整分片，再由当前 Strata 检查和准备。\n"
+            "  · 辅助项留空时由 Strata 复用或准备已知的兼容资源。\n\n"
+            "启动器 V3.7.5 · 扩展模型安装\n"
+            "  · 增加 Hy4-Flash 和 Inkling 2 Mini 的 Strata 模型规格。\n\n"
+            "随包 Strata 版本：0.2.20。当前启用的 Strata 版本可在维护工具中查看。")
         ctk.CTkLabel(card, text=text, text_color=COLORS["text"], justify="left",
                      font=ctk.CTkFont(family=FONT, size=12)).pack(anchor="w", padx=16, pady=(0, 14))
         return page
 
     def _refresh_install_page(self):
-        mode = self.current_mode()
-        if mode == "installed":
-            self.wizard_card.pack_forget()
-            self.installed_card.pack(fill="x", pady=(0, 12))
-            ents = self.model_cache()
-            if ents:
-                items = []
-                for e in ents[:8]:
-                    if not e.get("path"):
-                        items.append(f"· {e.get('label', '—')}（未配置，可在「概览」页点启动或应用上下文生成配置）")
-                        continue
-                    name = Path(e.get("path", "")).name or "—"
-                    ctx = e.get("context")
-                    ctx_txt = f"，上下文 {ctx_label(ctx)}" if ctx else ""
-                    items.append(f"· {e.get('label', '—')}（配置 {name}{ctx_txt}）")
-                self.installed_info.configure(text="检测到以下已安装模型：\n" + "\n".join(items) +
-                                                   "\n\n直接在「概览」页选择并启动即可。")
-            else:
-                self.installed_info.configure(text="未检测到模型配置文件。若模型已下载，请先在「网络与配置 → 目录设置」"
-                                                   "确认「模型数据目录」指向 Strata-data 根目录（如 R:\\Strata-main\\Strata-data），"
-                                                   "再点「使用自动」重新扫描；也可点击下方按钮安装新模型。")
+        ents = self.model_cache()
+        if ents:
+            items = []
+            for e in ents[:8]:
+                if not e.get("path"):
+                    items.append(f"· {e.get('label', '—')}（未配置，可在「概览」页点启动或应用上下文生成配置）")
+                    continue
+                name = Path(e.get("path", "")).name or "—"
+                ctx = e.get("context")
+                ctx_txt = f"，上下文 {ctx_label(ctx)}" if ctx else ""
+                items.append(f"· {e.get('label', '—')}（配置 {name}{ctx_txt}）")
+            self.installed_info.configure(text="检测到以下已安装模型：\n" + "\n".join(items) +
+                                               "\n\n直接在「概览」页选择并启动即可。")
         else:
-            self.installed_card.pack_forget()
-            self.wizard_card.pack(fill="x", pady=(0, 12))
-            self._on_family_change()
-            self._refresh_conn()
+            self.installed_info.configure(text="未检测到模型配置文件。若模型已下载，请先在「网络与配置 → 目录设置」"
+                                               "确认「模型数据目录」指向 Strata-data 根目录（如 R:\\Strata-main\\Strata-data），"
+                                               "再点「使用自动」重新扫描；也可点击下方按钮安装新模型。")
+        self._on_family_change()
+        self._refresh_auxiliary_panels()
 
     def on_close(self):
         if self.server.running():
@@ -4831,10 +5330,13 @@ class StrataLauncher(ctk.CTk):
         self._closing = True
         if getattr(self, '_launch_cancel', None):
             self._launch_cancel.set()
+        self._save_exit_settings()
+        self.destroy()
+
+    def _save_exit_settings(self):
         self.save_all_settings("退出自动保存")
         self.cfg.set("window_maximized", self.state() == "zoomed")
         self.cfg.set("window_geometry", self._normal_geometry if self.state() == "zoomed" else self.geometry())
-        self.destroy()
 
 
 def main():
@@ -4849,6 +5351,12 @@ if __name__ == "__main__":
         from strata_selftest import run_context_selftest
         _res = run_context_selftest(print)
         sys.exit(0 if _res["failed"] == 0 else 1)
+    if len(sys.argv) == 3 and sys.argv[1] == "--check-release-version":
+        sys.exit(0 if sys.argv[2] == APP_VERSION else 1)
+    if len(sys.argv) == 3 and sys.argv[1] == "--check-update-python":
+        code = "import runpy, sys; sys.path.insert(0, sys.argv[1]); runpy.run_path(sys.argv[2])"
+        sys.exit(subprocess.run([sys.argv[2], "-E", "-c", code, str(UPDATE_HELPERS),
+                                 str(UPDATE_HELPERS / "strata_update.py")]).returncode)
     try:
         sys.exit(main())
     except Exception as exc:                       # noqa: BLE001

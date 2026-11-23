@@ -1,4 +1,6 @@
+import os
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -6,6 +8,18 @@ from strata_optimization import apply_runtime_optimization, model_settings
 
 
 class OptimizationTests(unittest.TestCase):
+    def test_native_cuda_uses_official_work_ram_reserve(self):
+        cfg = {'backend': 'cuda', 'model_name': 'Qwen3.8-Flash-Next-IQ3_S',
+               'args': ['--native', 'model.gguf']}
+        with patch.dict('os.environ', {}, clear=True):
+            result, _ = apply_runtime_optimization(cfg, {}, 'model.json', None)
+            manual, _ = apply_runtime_optimization(
+                dict(cfg, env={'STRATA_RAM_KEEP_GIB': '12'}), {}, 'model.json', None)
+        if os.name == 'nt':
+            self.assertEqual(result['env']['STRATA_RAM_KEEP_GIB'], '8')
+        self.assertEqual(manual['env']['STRATA_RAM_KEEP_GIB'], '12')
+        self.assertNotIn('env', cfg)
+
     def test_default_preserves_thinking_and_single_request(self):
         with TemporaryDirectory() as tmp:
             original = {'args': ['--spec', '4'], 'parallel': 2}
@@ -20,10 +34,25 @@ class OptimizationTests(unittest.TestCase):
         result, _ = apply_runtime_optimization(original, {'kv_resident': 32768}, 'model.json', None)
         self.assertEqual(result['args'].count('--kv-resident'), 1)
         self.assertEqual(result['args'][result['args'].index('--kv-resident') + 1], '32768')
-        self.assertEqual(result['args'][result['args'].index('--vram-reserve-mib') + 1], '500')
+        self.assertEqual(result['args'][result['args'].index('--vram-reserve-mib') + 1], '700')
         self.assertNotIn('--kv-grow', result['args'])
         self.assertEqual(result['env']['STRATA_KV_GROW'], '0')
         self.assertIn('--kv-grow', original['args'])
+
+    def test_vram_floor_preserves_larger_user_reserve_and_disables_elastic_vision(self):
+        original = {
+            'vision': {'elastic': True},
+            'vram_elastic': True,
+            'args': ['--vram-elastic', '--vram-reserve-mib', '700'],
+            'args_written': ['--vram-elastic', '--vram-reserve-mib', '700'],
+            'user_args': ['--vram-reserve-mib', '2048', '--spec', '4', '--vram-elastic'],
+        }
+        result, _ = apply_runtime_optimization(original, {}, 'model.json', None)
+        self.assertIs(result['vram_elastic'], False)
+        self.assertEqual(result['vision'], original['vision'])
+        self.assertEqual(result['args'], ['--vram-reserve-mib', '2048'])
+        self.assertEqual(result['user_args'], ['--spec', '4', '--vram-reserve-mib', '2048'])
+        self.assertEqual(original['user_args'][1], '2048')
 
     def test_full_kv_and_invalid_residency(self):
         result, _ = apply_runtime_optimization({'args': ['--kv-resident', '32768']},
@@ -68,6 +97,27 @@ class OptimizationTests(unittest.TestCase):
             result, _ = apply_runtime_optimization({}, {'effort': 'high', 'budget': 8192}, Path(tmp) / 'model.json', Path(tmp))
             self.assertEqual(result['reasoning_budget_tokens'], 8192)
             self.assertEqual(model_settings({'effort': 'high'})['reasoning_effort'], 'high')
+
+    def test_local_profile_keeps_legacy_history_across_engine_updates(self):
+        from strata_optimization import _model_dir
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = root / '.strata-versions'
+            old = store / 'release-0.2.15' / 'strata-local-abc-iq3_s.json'
+            new = store / 'release-0.2.19' / 'terminal' / old.name
+            old.parent.mkdir(parents=True)
+            legacy = _model_dir(old, root) / 'expert-profile.bin'
+            legacy.parent.mkdir(parents=True)
+            legacy.write_bytes(b'learned')
+            cfg = {'local_import': {'identity': 'abc'}}
+            newer, _ = apply_runtime_optimization(cfg, {'profile': True}, new, root)
+            older, _ = apply_runtime_optimization(cfg, {'profile': True}, old, root)
+            other, _ = apply_runtime_optimization(cfg, {'profile': True},
+                                                   new.with_name('strata-local-abc-iq4_xs.json'), root)
+            self.assertEqual(older['expert_profile_save'], newer['expert_profile_save'])
+            self.assertEqual(Path(newer['expert_profile_save']).read_bytes(), b'learned')
+            self.assertNotEqual(newer['expert_profile_save'], other['expert_profile_save'])
+            self.assertEqual(legacy.read_bytes(), b'learned')
 
     def test_per_model_profile_paths_are_distinct(self):
         with TemporaryDirectory() as tmp:

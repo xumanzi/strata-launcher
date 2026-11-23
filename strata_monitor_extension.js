@@ -148,6 +148,19 @@
         set("su-requests", view.requests); set("su-compression", view.compression);
         set("su-saved", view.saved, view.savedExact); set("su-last-compression", view.lastCompression);
         set("su-status", `${data.current_request ? '生成中 · 累计含本次未结算' : '统计已结算'} · 每秒刷新 · 更新于 ${view.updated}`);
+        const experts = document.getElementById('slots-text');
+        if (experts) {
+          try {
+            const response = await authorizedFetch('/metrics');
+            const metrics = response.ok ? await response.json() : {};
+            const engine = metrics.engine || {};
+            if (engine.arch === 'inkling2_loop') {
+              experts.textContent = engine.expert_slots != null
+                ? `${number(engine.expert_slots)} / ${number(engine.expert_total)} 个专家`
+                : '当前引擎未提供专家驻留统计';
+            }
+          } catch (_) { /* Usage accounting remains available during a metrics retry. */ }
+        }
       } catch (error) { set("su-status", `统计暂不可用：${error.message || error}`); }
       finally { refreshing = false; }
     }

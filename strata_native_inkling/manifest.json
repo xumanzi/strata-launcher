@@ -1,0 +1,15 @@
+{
+  "build": "0.1.66-gguf-dspark-1",
+  "architectures": [
+    75,
+    80,
+    86,
+    89,
+    120
+  ],
+  "files": {
+    "cudart64_13.dll": "d26fd1c2629594759af569a5252f94e4568d4ebeca67dc323834deb141aa278a",
+    "LICENSE-Strata.txt": "949b9b0aada7476006469e58ee4ffb0e0f68c2d9137e90a356757b61a09d37f0",
+    "strata-inkling.exe": "ba43f9d9309278d58be75b1a7e9f6c70b9224c994c60c83d4cf7527d8e5030aa"
+  }
+}

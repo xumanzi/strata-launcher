@@ -15,8 +15,24 @@ from strata_launcher import ServerProcess
 
 
 class LatestServiceTests(unittest.TestCase):
+    def test_restart_waits_for_available_ram_to_stabilize(self):
+        server = ServerProcess()
+        server._wait_for_ram = True
+        gib = 1024 ** 3
+        samples = [28, 34, 44] + [44] * 8
+        elapsed = [0.0]
+        with patch('strata_launcher.time.monotonic', side_effect=lambda: elapsed[0]), \
+                patch('strata_launcher.time.sleep', side_effect=lambda seconds: elapsed.__setitem__(0, elapsed[0] + seconds)), \
+                patch('strata_launcher.psutil.virtual_memory',
+                      side_effect=[SimpleNamespace(available=n * gib) for n in samples]) as memory:
+            server._await_ram_recovery()
+        self.assertEqual(memory.call_count, len(samples))
+        self.assertEqual(elapsed[0], 5.0)
+        self.assertFalse(server._wait_for_ram)
+        self.assertIn('44.0 GiB', server.log_queue.get_nowait())
+
     def test_deepseek_config_reaches_latest_service_through_gateway(self):
-        root = Path('build/official-latest/Strata-0.2.6').resolve()
+        root = Path('.strata-baseline-0211/Strata-0.2.11').resolve()
         self.assertTrue((root / 'serve/server.py').is_file())
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / 'strata-deepseek-test.json'
@@ -80,3 +96,4 @@ class LatestServiceTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

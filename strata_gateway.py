@@ -10,13 +10,17 @@ import os
 import select
 import socket
 import threading
+import time
 import uuid
+
+import psutil
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PureWindowsPath
 from urllib.parse import urlsplit
 
 from strata_memory import ContextCompressor, ContextSummaryError, summary_messages
 from strata_usage import UsageTracker
+from strata_launch_support import cuda_headroom
 
 CHAT_PATHS = {'/v1/chat/completions', '/v1/messages', '/v1/responses'}
 HOP_HEADERS = {'connection', 'transfer-encoding', 'keep-alive', 'proxy-authenticate',
@@ -220,7 +224,7 @@ def output_limit(path, body):
 class ContextGateway:
     def __init__(self, host, port, backend_port, policy, api_key='', cfg_path=None,
                  runtime_config=None, timeout=3600, summary_timeout=300, allowed_hosts=None, trusted_origins=None,
-                 log=None, web_root=None, thinking_default='high'):
+                 log=None, web_root=None, thinking_default='high', llama_backend=False, model_name=''):
         self.backend_port, self.api_key, self.cfg_path = backend_port, api_key, Path(cfg_path) if cfg_path else None
         self.runtime_config = Path(runtime_config) if runtime_config else None
         self.path_replacements = {}
@@ -237,6 +241,9 @@ class ContextGateway:
         self.compressor = ContextCompressor()
         self.usage = UsageTracker()
         self.context_window = 0
+        self.llama_backend, self.model_name = llama_backend, model_name
+        self.hardware_lock = threading.Lock()
+        self.gpu_sample = (float('-inf'), None)
         self.count_cache, self.count_lock = collections.OrderedDict(), threading.Lock()
         self.allowed_hosts = set(allowed_hosts or []) | {'localhost', '127.0.0.1', '::1', socket.gethostname().lower()}
         self.trusted_origins = set(trusted_origins or [])
@@ -406,6 +413,10 @@ class ContextGateway:
                         elif self.command != 'GET':
                             raise GatewayError('method not allowed', 405)
                         return self.reply(gateway.report())
+                    if gateway.launch_ready is not None and not gateway.launch_ready.is_set():
+                        raise GatewayError('Model startup and GPU memory verification in progress', 503)
+                    if gateway.llama_backend and self.command == 'GET' and path == '/metrics':
+                        return self.reply(gateway.llama_metrics())
                     def watch():
                         while not done.wait(.2):
                             try:
@@ -523,6 +534,7 @@ class ContextGateway:
         self.port = self.server.server_port
         self.cancel_events, self.events_lock = set(), threading.Lock()
         self.started = False
+        self.launch_ready = None
 
     def start(self):
         self.started = True
@@ -661,7 +673,7 @@ class ContextGateway:
         requests = self.usage.forwarded_requests()
         # /metrics describes engine work, not a gateway request ID. Only attribute it
         # when one user request is in flight; parallel streams retain their own usage.
-        if len(requests) == 1:
+        if len(requests) == 1 and not self.llama_backend:
             try:
                 metrics = self.json_backend('/metrics', cancel=cancel, timeout=2)
                 live = metrics.get('live') or {}
@@ -673,6 +685,39 @@ class ContextGateway:
             except (GatewayError, OSError, http.client.HTTPException, ValueError, TypeError, AttributeError):
                 pass
         return self.usage.snapshot(self.context_window)
+
+    def llama_metrics(self):
+        snapshot = self.usage_snapshot()
+        memory = psutil.virtual_memory()
+        hardware = {'ram_total': memory.total, 'ram_used': memory.total - memory.available}
+        with self.hardware_lock:
+            now = time.monotonic()
+            sampled, memory = self.gpu_sample
+            if now - sampled >= 5:
+                memory = cuda_headroom()
+                self.gpu_sample = (now, memory)
+        if memory is not None:
+            free, total = memory
+            hardware.update(gpu_mem_used=(total - free) * 1024**2, gpu_mem_total=total * 1024**2)
+
+        last = snapshot['last_request']
+        recent = []
+        if last is not None:
+            recent.append({
+                'id': last['finished_at'], 'time': last['finished_at'],
+                'prompt_tokens': last['input_tokens'] if last['precise'] else None,
+                'output_tokens': last['output_tokens'] if last['precise'] else None,
+                'finish': 'error' if last['status'] >= 400 else None,
+            })
+        running = len(self.usage.forwarded_requests())
+        current = snapshot.get('current_request') or {}
+        return {
+            'live': {'state': 'generating' if running else 'idle', 'running': running,
+                     'generated': current.get('output_tokens'), 'tok_s': None},
+            'engine': {'model': self.model_name, 'max_context': self.context_window},
+            'hardware': hardware,
+            'requests': recent, 'requests_kept': len(recent),
+        }
 
     def summarize(self, payload, cap, model, cancel):
         result = self.json_backend('/v1/chat/completions', {'model': model, 'messages': summary_messages(payload),

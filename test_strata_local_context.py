@@ -7,12 +7,35 @@ from unittest.mock import patch
 
 
 class LocalContextTests(unittest.TestCase):
+    def test_native_inkling_one_million_context_does_not_add_qwen_flags(self):
+        from strata_launch_support import save_local_context
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'inkling.json'
+            config = dict(arch='inkling2_loop', local_import={'family': 'inkling-2-mini'},
+                          args=['--native', 'model.gguf', '--max-context', '262144', '--dspark', 'draft.gguf'])
+            path.write_text(json.dumps(config), encoding='utf-8')
+            result = save_local_context(path, 1048576)
+            self.assertEqual(result['args'], ['--native', 'model.gguf', '--max-context', '1048576', '--dspark', 'draft.gguf'])
+
     def config(self):
         return {'exe': 'engine', 'args': ['--pack', 'private-pack', '--native', 'custom-model.gguf',
             '--ple-gguf', 'custom-shard2.gguf', '--max-context', '32768', '--kv', 'int8'],
             'model_name': 'full-custom-name', 'local_import': {'family': 'qwen', 'model': 'IQ3_XXS',
             'identity': 'keep', 'folder': 'custom-folder'}, 'api_key': 'keep-key',
             'sampling': {'temperature': 0.6}, 'context_compress_enabled': True}
+
+    def test_llama_context_uses_ctx_size_and_preserves_draft_options(self):
+        from strata_launch_support import local_context_choices, save_local_context
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'strata-inkling.json'
+            config = {'engine': 'llama.cpp', 'local_import': {'family': 'inkling-2-mini'},
+                      'args': ['--ctx-size', '4096', '--max-context', '8192', '--kv', 'int8',
+                               '--spec-type', 'draft-dspark', '--cache-type-k', 'q8_0']}
+            path.write_text(json.dumps(config), encoding='utf-8')
+            self.assertEqual(local_context_choices(config)['context'], 4096)
+            updated = save_local_context(path, 16384)
+            self.assertEqual(updated['args'], ['--ctx-size', '16384', '--spec-type', 'draft-dspark',
+                                                '--cache-type-k', 'q8_0'])
 
     def test_import_metadata_enables_context_selection(self):
         from strata_launcher import StrataEnv

@@ -29,9 +29,17 @@ class CatalogTests(unittest.TestCase):
     def test_bundled_catalog_supports_new_install_without_existing_source(self):
         from strata_catalog import bundled_tables, family_models
         models, families, contexts = bundled_tables()
-        self.assertEqual(len(families), 8)
-        self.assertEqual(sum(len(family_models(models, f)) for f in families), 25)
-        self.assertEqual(len(family_models(models, 'deepseek41')), 4)
+        self.assertEqual(len(families), 9)
+        self.assertEqual(sum(len(family_models(models, f)) for f in families), 44)
+        self.assertEqual(len(family_models(models, 'unsloth')), 12)
+        self.assertIn('UD-IQ4_XS-v31', family_models(models, 'unsloth'))
+        self.assertNotIn('UD-IQ1_S', family_models(models, 'unsloth'))
+        self.assertEqual(set(family_models(models, 'hy4-flash')), {'SQ-64', 'SQ-96', 'SQ-128'})
+        inkling = family_models(models, 'inkling-2-mini')
+        self.assertTrue({'SQ-10', 'SQ-15', 'SQ-20', 'UD-IQ4_XS', 'UD-Q4_K_XL'}.issubset(inkling))
+        self.assertEqual(len(inkling), 13)
+        self.assertIn(262144, inkling['SQ-10']['contexts'])
+        self.assertTrue(inkling['SQ-10']['vision'])
         self.assertIn(8192, contexts)
 
     def env(self):
@@ -74,7 +82,7 @@ class CatalogTests(unittest.TestCase):
             '--resident-budget-gib', '22', '--kv-streaming', 'on', '--parallel', '2',
             '--vram-reserve-mib', '700', '--gpus', '0,1', '--host', '127.0.0.1', '--no-start']
         out = adapt_install_args(args, {'multi_file': True, 'vision': False, 'contexts': [8192]})
-        self.assertEqual(out[out.index('--context') + 1], '8192')
+        self.assertEqual(out[out.index('--context') + 1], '32768')
         self.assertEqual(out[out.index('--vision') + 1], 'no')
         self.assertEqual(out[out.index('--gpus') + 1], '0,1')
         for flag in ('--kv', '--experimental-speed-projection', '--low-ram', '--draft-vocab',

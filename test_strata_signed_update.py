@@ -37,6 +37,35 @@ class NativeUpdateTests(unittest.TestCase):
    with patch.object(u,'atomic_json',side_effect=fail):
     with self.assertRaises(OSError): u.activate_components(r,{c:p,c2:p})
    self.assertEqual(json.loads(c.read_text()),data)
+ def test_external_backend_is_excluded_from_native_engine_repair_and_verification(self):
+  with tempfile.TemporaryDirectory() as d:
+   root,path,pkg,config=self.fixture(d)
+   config.update(engine='llama.cpp',exe=str(root/'llama-server.exe'),args=['--model','mini.gguf','--ctx-size','4096'])
+   path.write_text(json.dumps(config))
+   with patch.object(u,'load_component_api') as loader:
+    u.repair_active_configs(root,path)
+    loader.assert_not_called()
+   self.assertEqual(u.engine_targets(root),{})
+   from strata_versions import validate_config_flags
+   parser=root/'src/program/generate.cpp'; parser.parent.mkdir(parents=True)
+   parser.write_text('const char * arg = "--native";')
+   validate_config_flags(root)
+   self.assertEqual(json.loads(path.read_text()),config)
+ def test_repair_prefers_recorded_auto_store_even_if_cuda_backend_is_known(self):
+  with tempfile.TemporaryDirectory() as d:
+   root,path,pkg,config=self.fixture(d)
+   config.update(backend='cuda',exe=str(pkg/'strata.exe'))
+   path.write_text(json.dumps(config))
+   ec=SimpleNamespace(resolve=Mock(return_value=SimpleNamespace(root=pkg)),verify_signature=Mock())
+   with patch.object(u,'load_component_api',return_value=ec):
+    u.repair_active_configs(root,path)
+   ec.resolve.assert_called_once_with(root/'.strata-launcher-components'/'auto',backend='cuda',full=True)
+ def test_unique_cuda_store_is_used_for_legacy_config_without_backend(self):
+  with tempfile.TemporaryDirectory() as d:
+   root,path,pkg,config=self.fixture(d)
+   auto=root/'.strata-launcher-components'/'auto'
+   auto.replace(auto.with_name('cuda'))
+   self.assertEqual(u.component_slot(root,config),'cuda')
  def test_cli_result_must_explicitly_confirm_engine(self):
   with self.assertRaises(RuntimeError): u.require_engine_result({'ok':True,'results':[{'component':'engine','status':'none-for-this-pc'}]})
   u.require_engine_result({'ok':True,'results':[{'component':'engine','status':'current'}]})

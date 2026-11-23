@@ -60,7 +60,7 @@ class DownloadTests(unittest.TestCase):
    with self.assertRaises(d.RangeUnavailable): d.parallel_transfer(url,p,17,len(DATA),None,None,5)
    self.assertEqual(p.read_bytes(),DATA[:17])
  def test_official_transport_falls_back_without_replacing_checksum_validation(self):
-  transfer=type('Transfer',(),{})(); original=Mock(); transfer._transfer=original; transfer._opener=None; transfer.check_url_policy=Mock(); transfer.kind_of=lambda url:'https'
+  transfer=type('Transfer',(),{})(); original=Mock(); transfer._transfer=lambda location,partial,have,size,progress,cancel,timeout: original(location,partial,have,size,progress,cancel,timeout); transfer._opener=None; transfer.check_url_policy=Mock(); transfer.kind_of=lambda url:'https'
   d.install_transport(transfer,threshold=1)
   from unittest.mock import patch
   with patch.object(d,'parallel_transfer',side_effect=d.RangeUnavailable('no ranges')):
@@ -80,3 +80,17 @@ class SourceDownloadTests(unittest.TestCase):
   self.assertEqual(d.source_urls('https://example.test/file.zip'),['https://example.test/file.zip'])
 
 if __name__=='__main__': unittest.main()
+
+def test_official_transfer_with_new_options_is_not_replaced():
+    from types import SimpleNamespace
+
+    def official(location, partial, have, size, progress, cancel, timeout, *,
+                 first=True, what='the download', say=None):
+        return first, what, say
+
+    transfer = SimpleNamespace(_transfer=official, _opener=None,
+                               kind_of=lambda url: 'https', check_url_policy=Mock())
+    d.install_transport(transfer, threshold=1)
+    assert transfer._transfer is official
+    assert transfer._transfer('https://example.test/a', Path('fixture'), 0, 100,
+                              None, None, 5, first=False, what='engine') == (False, 'engine', None)

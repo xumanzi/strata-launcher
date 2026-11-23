@@ -16,16 +16,114 @@ from pathlib import Path, PureWindowsPath
 
 
 
+def cuda_headroom():
+    try:
+        result = subprocess.run(["nvidia-smi", "--query-gpu=memory.free,memory.total",
+                                 "--format=csv,noheader,nounits"],
+                                capture_output=True, text=True, check=True, timeout=3,
+                                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+        rows = list(csv.reader(result.stdout.splitlines()))
+        if len(rows) == 1:
+            free, total = map(int, rows[0])
+            return free, total
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def check_launch_headroom(config, log):
+    """Apply the llama.cpp fit floor and preflight CUDA when VRAM is visible."""
+    args = config.get("args", [])
+    external = config.get("engine") == "llama.cpp"
+
+    def value(names, default):
+        for i in range(len(args) - 1, -1, -1):
+            key, sep, inline = args[i].partition("=")
+            if key in names:
+                return inline if sep else args[i + 1]
+        return default
+
+    def set_flag(names, setting):
+        for i in range(len(args) - 1, -1, -1):
+            if args[i] in names:
+                del args[i:i + 2]
+            elif args[i].split("=", 1)[0] in names:
+                del args[i]
+        args.extend((names[0], setting))
+
+    target = ("--fit-target", "-fitt") if external else ("--vram-reserve-mib", "--reserve-mib")
+    reserve = [max(500, int(n)) for n in str(value(target, "500")).split(",")]
+    if external:
+        set_flag(("--fit", "-fit"), "on")
+        # DSpark fitting can omit the draft context. Budget its weights and
+        # a work-buffer margin separately from the user's free-VRAM floor.
+        draft = value(("--model-draft", "-md"), None)
+        spec = value(("--spec-type",), "")
+        extra = 0
+        if draft and "draft-dspark" in spec.split(",") and Path(draft).is_file():
+            mib = 1024**2
+            extra = (Path(draft).stat().st_size + mib - 1) // mib + 256
+        set_flag(target, ",".join(str(n + extra) for n in reserve))
+        context = int(value(("--ctx-size", "-c"), 0))
+        if context > 0:
+            set_flag(("--fit-ctx", "-fitc"), str(context))
+    if not external and config.get("backend") not in ("cuda", None):
+        return
+    if external and value(("--n-gpu-layers", "-ngl", "--gpu-layers"), None) == "0":
+        return
+    memory = cuda_headroom()
+    if memory is None:
+        log("[memory] CUDA 空闲显存不可读或有多张显卡，采用引擎的预留设置。")
+        return None
+    free, total = memory
+    if free <= reserve[0]:
+        raise ValueError(f"当前 CUDA 空闲显存 {free} MiB，无法预留 {reserve[0]} MiB 后加载模型。")
+    log(f"[memory] CUDA 空闲显存 {free} MiB，预留目标 {reserve[0]} MiB。")
+    if (external and config.get("launcher_managed_dspark") and extra and context >= 262144
+            and 15000 <= total <= 16384 and value(("--n-gpu-layers", "-ngl", "--gpu-layers"), None) is None):
+        set_flag(("--n-gpu-layers", "-ngl", "--gpu-layers"), "12")
+        if value(("--n-gpu-layers-draft", "-ngld", "--gpu-layers-draft", "--spec-draft-ngl"), None) is None:
+            set_flag(("--n-gpu-layers-draft",), "0")
+        if not any(flag in args for flag in ("--no-kv-offload", "-nkvo")):
+            args.append("--no-kv-offload")
+        log("[memory] 16 GiB 显卡运行 262K DSpark：部分模型层、KV 和草稿权重使用系统内存。")
+    return (500 if config.get('launcher_speed_priority') else reserve[0]) if (external or config.get('launcher_speed_priority')) else None
+
+
+def normalize_llamacpp_config(config):
+    """Drop flags written by old launcher versions' Strata context editor."""
+    if config.get('engine') != 'llama.cpp':
+        return config
+    result = dict(config)
+    args = list(config.get('args', []))
+    obsolete = ['--max-context', '--kv', '--kv-resident', '--rope-scaling']
+    if result.pop('launcher_context_auto_rope', None):
+        obsolete.append('--rope-scale')
+    legacy_context = None
+    for flag in obsolete:
+        while flag in args:
+            index = args.index(flag)
+            if flag == '--max-context' and index + 1 < len(args):
+                legacy_context = args[index + 1]
+            del args[index:index + 2]
+    if '--ctx-size' not in args and legacy_context and str(legacy_context).isdigit():
+        args.extend(('--ctx-size', str(legacy_context)))
+    result['args'] = args
+    return result
+
+
 def local_context_choices(config):
+    config = normalize_llamacpp_config(config)
     local = config.get('local_import')
     if not local:
         return None
     args = config.get('args', [])
     def value(flag):
         return args[args.index(flag) + 1] if flag in args else None
+    context_flag = '--ctx-size' if config.get('engine') == 'llama.cpp' else '--max-context'
     return dict(family=local.get('family'), model=local.get('model'),
-                context=int(value('--max-context')) if value('--max-context') else None,
-                kv=value('--kv'), local_import=True)
+                context=int(value(context_flag)) if value(context_flag) else None,
+                kv=value('--kv') or value('--cache-type-k'), local_import=True)
 
 
 def save_local_context(path, context):
@@ -34,7 +132,7 @@ def save_local_context(path, context):
         raise ValueError('上下文必须是正整数')
     path = Path(path)
     original = path.read_bytes()
-    config = json.loads(original.decode('utf-8-sig'))
+    config = normalize_llamacpp_config(json.loads(original.decode('utf-8-sig')))
     if not config.get('local_import'):
         raise ValueError('该配置不是本地导入模型')
     args = list(config.get('args', []))
@@ -49,26 +147,35 @@ def save_local_context(path, context):
             args[args.index(flag) + 1] = str(val)
         else:
             args.extend([flag, str(val)])
-    old_context = int(value('--max-context') or 32768)
-    scaling, scale = value('--rope-scaling'), value('--rope-scale')
-    trained = 262144
-    automatic = config.get('launcher_context_auto_rope', False) or (
-        scaling == 'yarn' and old_context > trained and scale is not None
-        and abs(float(scale) - old_context / trained) < 1e-6)
-    if automatic:
-        remove('--rope-scaling'); remove('--rope-scale')
-        scaling = None
-    if context > trained and scaling in (None, 'none'):
-        set_value('--rope-scaling', 'yarn')
-        set_value('--rope-scale', format(context / trained, 'g'))
-        config['launcher_context_auto_rope'] = True
-    else:
-        config.pop('launcher_context_auto_rope', None)
-    if context < 65536:
+    if config.get('engine') == 'llama.cpp':
+        set_value('--ctx-size', context)
+    elif config.get('arch') in ('inkling2_loop', 'hy4flash'):
+        remove('--rope-scaling')
+        remove('--rope-scale')
         remove('--kv-resident')
-    if context > 8192 and '--kv' not in args:
-        set_value('--kv', 'int8')
-    set_value('--max-context', context)
+        config.pop('launcher_context_auto_rope', None)
+        set_value('--max-context', context)
+    else:
+        old_context = int(value('--max-context') or 32768)
+        scaling, scale = value('--rope-scaling'), value('--rope-scale')
+        trained = 262144
+        automatic = config.get('launcher_context_auto_rope', False) or (
+            scaling == 'yarn' and old_context > trained and scale is not None
+            and abs(float(scale) - old_context / trained) < 1e-6)
+        if automatic:
+            remove('--rope-scaling'); remove('--rope-scale')
+            scaling = None
+        if context > trained and scaling in (None, 'none'):
+            set_value('--rope-scaling', 'yarn')
+            set_value('--rope-scale', format(context / trained, 'g'))
+            config['launcher_context_auto_rope'] = True
+        else:
+            config.pop('launcher_context_auto_rope', None)
+        if context < 65536:
+            remove('--kv-resident')
+        if context > 8192 and '--kv' not in args:
+            set_value('--kv', 'int8')
+        set_value('--max-context', context)
     config['args'] = args
     Path(str(path) + '.context-size.bak').write_bytes(original)
     temp = None
@@ -167,6 +274,13 @@ def prepare_engine_paths(config):
     if isinstance(adapted.get('vision'), dict):
         adapted['vision'] = {key: windows_engine_path(value) if key in ('exe', 'cwd', 'model', 'mmproj')
                              else value for key, value in adapted['vision'].items()}
+    for key in ('args', 'user_args'):
+        if isinstance(adapted.get(key), list):
+            values = list(adapted[key])
+            while '--experimental-speed-projection' in values:
+                index = values.index('--experimental-speed-projection')
+                del values[index:index + 2]
+            adapted[key] = values
     return adapted
 
 
@@ -247,14 +361,15 @@ def http_probe(url, timeout=2.0):
         return 0, str(error)
 
 
-def strata_health_ready(status, body):
+def strata_health_ready(status, body, *, llama_backend=False):
     if status != 200:
         return False
     try:
         health = json.loads(body)
     except (TypeError, ValueError):
         return False
-    return isinstance(health, dict) and health.get('service') == 'strata' and health.get('status') == 'ok'
+    return (isinstance(health, dict) and health.get('status') == 'ok'
+            and (llama_backend or health.get('service') == 'strata'))
 
 
 def port_in_use(port):
@@ -333,6 +448,16 @@ def resolve_launch_config(config, root):
         if not old.is_absolute():
             return value
         candidates = []
+        parts = old.parts
+        if '.strata-versions' in parts:
+            index = parts.index('.strata-versions') + 1
+            if index < len(parts) and parts[index].startswith('release-'):
+                candidates.append(root.joinpath(*parts[index + 1:]))
+        # Release-owned resources follow the active release even after cwd was migrated.
+        if '.strata-versions' in old.parts:
+            index = old.parts.index('.strata-versions')
+            if len(old.parts) > index + 2 and old.parts[index + 1].startswith('release-'):
+                candidates.append(root.joinpath(*old.parts[index + 2:]))
         if old_cwd.is_absolute():
             for previous, current in ((old_cwd, root), (old_cwd.parent, root.parent)):
                 try:
@@ -348,11 +473,48 @@ def resolve_launch_config(config, root):
             adapted[key] = resolve(adapted[key])
     if isinstance(adapted.get('args'), list):
         adapted['args'] = [resolve(arg) for arg in adapted['args']]
+        args = adapted['args']
+        # Old local imports can point to a profile from a removed release.
+        for index in range(len(args) - 2, -1, -1):
+            if args[index] == '--expert-profile' and not Path(args[index + 1]).is_file():
+                del args[index:index + 2]
+        local = adapted.get('local_import') or {}
+        family = local.get('family')
+        if (adapted.get('backend') == 'cuda' and family in ('qwen', 'coder')
+                and 'flash-next' in str(adapted.get('model_name', '')).lower()
+                and '--native' in args and '--expert-profile' not in args
+                and '--expert-profile' not in (adapted.get('user_args') or [])):
+            # Native IQ packs require speculative verification. Use the same
+            # shipped profile as Strata setup to seed the GPU expert cache.
+            default_name = 'expert-profile-coder.bin' if family == 'coder' else 'expert-profile.bin'
+            default_profile = root / 'data' / default_name
+            if default_profile.is_file():
+                args.extend(('--expert-profile', str(default_profile)))
+                if '--expert-cache' not in args:
+                    args.extend(('--expert-cache', 'auto'))
+        profile = adapted.get('expert_profile')
+        if profile:
+            profile = resolve(profile)
+            if Path(profile).is_file():
+                adapted['expert_profile'] = profile
+            else:
+                adapted.pop('expert_profile', None)
     if isinstance(adapted.get('lib_dirs'), list):
         adapted['lib_dirs'] = [resolve(path) for path in adapted['lib_dirs']]
     if isinstance(adapted.get('vision'), dict):
         adapted['vision'] = {k: resolve(v) if k in ('exe', 'cwd', 'model', 'mmproj') else v
                              for k, v in adapted['vision'].items()}
+    log = adapted.get('log')
+    if isinstance(log, str) and log:
+        log_path = Path(log)
+        # Managed release directories are disposable. Logs belong to the active release.
+        windows_log = PureWindowsPath(log)
+        stale_release = any(part.startswith('release-') for part in windows_log.parts) and '.strata-versions' in windows_log.parts
+        if stale_release or not log_path.is_absolute():
+            log_path = root / windows_log.name
+        elif not log_path.parent.is_dir():
+            log_path = root / windows_log.name
+        adapted['log'] = str(log_path)
     exe = adapted.get('exe')
     if isinstance(exe, str) and not PureWindowsPath(exe).is_absolute():
         cwd = Path(adapted.get('cwd') or root)

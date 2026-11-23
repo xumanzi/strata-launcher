@@ -117,7 +117,7 @@ class LauncherUpdateTests(unittest.TestCase):
    u.record_release(r,'0.2.3.1',u.SOURCE_MARKER)
    env.update_from_zip(version='0.2.3.1')
    env.download.assert_not_called()
- def test_old_success_cache_does_not_block_retry(self):
+ def test_startup_check_only_reports_new_release(self):
   from strata_launcher import StrataLauncher
   from types import SimpleNamespace
   cfg={'auto_update':True,'version_pinned':False,'last_auto_updated_version':'0.2.3.1'}
@@ -125,7 +125,7 @@ class LauncherUpdateTests(unittest.TestCase):
    ver_label=SimpleNamespace(configure=Mock()),up_status=SimpleNamespace(configure=Mock()),
    tools_log=SimpleNamespace(append=Mock()),_start_update=Mock())
   StrataLauncher._apply_update_info(app,'0.1.48.1','0.2.3.1','', '', '',True)
-  app._start_update.assert_called_once_with(auto=True)
+  app._start_update.assert_not_called()
 
 class LatestSetupTests(unittest.TestCase):
  def test_latest_setup_imports_sibling_control_and_refreshes_its_modules(self):

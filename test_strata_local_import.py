@@ -3,7 +3,52 @@ import unittest
 from pathlib import Path
 
 
+class InklingGGUFImportTests(unittest.TestCase):
+    def test_native_path_uses_metadata_and_excludes_auxiliary_gguf(self):
+        from types import ModuleType
+        from unittest.mock import patch
+        from strata_local_import import inspect_inkling_gguf
+        import sys
+
+        control = ModuleType("strata_control")
+        preflight = ModuleType("strata_control.gguf_preflight")
+        preflight.ProfileError = RuntimeError
+        preflight.inspect_metadata = lambda _path: {"architecture": "inkling2_loop"}
+        with tempfile.TemporaryDirectory() as directory, patch.dict(sys.modules, {
+                "strata_control": control, "strata_control.gguf_preflight": preflight}):
+            directory = Path(directory)
+            model = directory / "Inkling-2-Mini-GSQ-RCO-IQ4_XS.gguf"
+            model.touch()
+            (directory / "mmproj-Inkling-2-Mini-BF16.gguf").touch()
+            self.assertEqual(inspect_inkling_gguf(directory)["shards"], [str(model.resolve())])
+            self.assertEqual(inspect_inkling_gguf(model)["format"], "inkling-gguf")
+            preflight.inspect_metadata = lambda _path: {"architecture": "qwen4exp"}
+            self.assertIsNone(inspect_inkling_gguf(model))
+
+
 class LocalImportTests(unittest.TestCase):
+    def test_v31_models_and_auxiliary_files(self):
+        from strata_local_import import inspect_model
+        for quant in ('UD-IQ1_M', 'UD-Q2_0', 'UD-IQ2_XS', 'UD-Q2_K_XL',
+                      'UD-IQ3_XXS', 'UD-Q3_K_XL', 'UD-IQ4_XS'):
+            with tempfile.TemporaryDirectory() as d:
+                folder = Path(d)
+                count = 4
+                for i in range(1, count + 1):
+                    (folder / f'Qwen3.8-Flash-Next-{quant}-{i:05d}-of-{count:05d}.gguf').write_bytes(b'GGUF')
+                for name in ('mtp-Qwen3.8-Flash-Next-Q8_0.gguf', 'mmproj-F16.gguf', 'engram.gguf'):
+                    (folder / name).write_bytes(b'GGUF')
+                info = inspect_model(folder)
+                self.assertEqual(info['model'], 'UD-IQ4_XS-v31' if quant == 'UD-IQ4_XS' else quant)
+                self.assertEqual(len(info['shards']), 4)
+
+    def test_qwen_iq1_s_rejected_before_preparation(self):
+        from strata_local_import import inspect_model
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / 'Qwen3.8-Flash-Next-UD-IQ1_S.gguf').write_bytes(b'GGUF')
+            with self.assertRaisesRegex(ValueError, 'UD-IQ1_S'):
+                inspect_model(d)
+
     def test_import_q4_split_and_single_file(self):
         from strata_local_import import inspect_model
         for quant in ('UD-Q4_K_XL', 'UD-IQ4_XS'):
@@ -66,7 +111,7 @@ class LocalImportTests(unittest.TestCase):
         cfg = {'args': ['--native', 'model.gguf', '--vision', '--vram-reserve-mib', '700', '--kv', 'int8'],
                'vision': {'exe': 'strata-vision.exe', 'mmproj': 'mmproj.gguf'}}
         result = apply_runtime_vision(cfg, Path('.'), False)
-        self.assertEqual(result['args'], ['--native', 'model.gguf', '--kv', 'int8'])
+        self.assertEqual(result['args'], ['--native', 'model.gguf', '--vram-reserve-mib', '700', '--kv', 'int8'])
         self.assertNotIn('vision', result)
         self.assertIn('--vision', cfg['args'])
 
